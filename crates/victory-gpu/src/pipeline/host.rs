@@ -883,7 +883,10 @@ mod tests {
 
     #[test]
     fn dxil_wave_lanes_reads_psv0_bounds() {
-        assert_eq!(dxil_wave_lanes(&synthetic_dxbc_with_psv0(0, u32::MAX)), None);
+        assert_eq!(
+            dxil_wave_lanes(&synthetic_dxbc_with_psv0(0, u32::MAX)),
+            None
+        );
         assert_eq!(
             dxil_wave_lanes(&synthetic_dxbc_with_psv0(64, 64)),
             Some((64, 64))
