@@ -1074,3 +1074,115 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_cmp_class_f32_matches_rdna2() {
+    let build = |abs0: bool, neg0: bool| {
+        let [mut w0, mut w1] = vop3(0x088, 6, vgpr(1), vgpr(2), 0);
+        if abs0 {
+            w0 |= 1 << 8; // abs[0] = 1
+        }
+        if neg0 {
+            w1 |= 1 << 29; // neg[0] = 1
+        }
+        let sel = vop3(0x101, 0, 0x80, 0x81, sgpr(6));
+        build_valu_cs(&[w0, w1, sel[0], sel[1]])
+    };
+
+    // All 10 IEEE-754 binary32 classes: bit k corresponds to class k.
+    let classes: &[(u32, u32)] = &[
+        (0x7F80_0001, 0), // +sNaN (quiet bit 0x40_0000 clear)
+        (0xFF80_0001, 0), // -sNaN
+        (0x7FC0_0000, 1), // +qNaN (quiet bit set)
+        (0xFFC0_0001, 1), // -qNaN
+        (0xFF80_0000, 2), // -inf
+        (0xBF80_0000, 3), // -normal (-1.0)
+        (0x8000_0001, 4), // -denormal
+        (0x8000_0000, 5), // -0.0
+        (0x0000_0000, 6), // +0.0
+        (0x0000_0001, 7), // +denormal
+        (0x3F80_0000, 8), // +normal (+1.0)
+        (0x7F80_0000, 9), // +inf
+    ];
+    let mut plain_cases = Vec::new();
+    for &(bits, cls) in classes {
+        plain_cases.push(([bits, 1u32 << cls, 0, 0], 1u32));
+        plain_cases.push(([bits, 0x3FF & !(1u32 << cls), 0, 0], 0u32));
+    }
+    let cmp_plain = build(false, false);
+    let plain_in: Vec<[u32; 4]> = plain_cases.iter().map(|c| c.0).collect();
+    run_cases(&cmp_plain, &plain_in, |backend, i, inp, got| {
+        let want = plain_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cmp_class_f32({:#010x}, {:#05x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+
+    // RDNA2 input modifiers on v_cmp_class_f32 manipulate the sign bit bitwise:
+    // they must not quiet sNaNs or flush denormals to zero.
+    struct ModCases {
+        label: &'static str,
+        abs: bool,
+        neg: bool,
+        items: &'static [(u32, u32)],
+    }
+    let mod_sets = [
+        ModCases {
+            label: "neg",
+            abs: false,
+            neg: true,
+            items: &[
+                (0x3F80_0000, 3), // -(+1.0) -> -normal
+                (0x0000_0000, 5), // -(+0.0) -> -0.0
+                (0x8000_0000, 6), // -(-0.0) -> +0.0
+                (0x0000_0001, 4), // -(+denormal) -> -denormal (not flushed to -0.0)
+                (0x8000_0001, 7), // -(-denormal) -> +denormal (not flushed to +0.0)
+                (0x7F80_0001, 0), // -(+sNaN) -> sNaN (not quieted to qNaN)
+                (0xFF80_0001, 0), // -(-sNaN) -> sNaN (not quieted to qNaN)
+            ],
+        },
+        ModCases {
+            label: "abs",
+            abs: true,
+            neg: false,
+            items: &[
+                (0xBF80_0000, 8), // |-1.0| -> +normal
+                (0x8000_0000, 6), // |-0.0| -> +0.0
+                (0xFF80_0000, 9), // |-inf| -> +inf
+                (0x8000_0001, 7), // |-denormal| -> +denormal
+                (0xFF80_0001, 0), // |-sNaN| -> sNaN
+            ],
+        },
+        ModCases {
+            label: "abs+neg",
+            abs: true,
+            neg: true,
+            items: &[
+                (0x3F80_0000, 3), // -|+1.0| -> -normal
+                (0xBF80_0000, 3), // -|-1.0| -> -normal
+                (0x0000_0001, 4), // -|+denormal| -> -denormal
+                (0x8000_0001, 4), // -|-denormal| -> -denormal
+                (0x7F80_0001, 0), // -|+sNaN| -> sNaN
+            ],
+        },
+    ];
+    for set in mod_sets {
+        let shader = build(set.abs, set.neg);
+        let mut cases = Vec::new();
+        for &(bits, cls) in set.items {
+            cases.push(([bits, 1u32 << cls, 0, 0], 1u32));
+            cases.push(([bits, 0x3FF & !(1u32 << cls), 0, 0], 0u32));
+        }
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: v_cmp_class_f32[{}]({:#010x}, {:#05x}) = {got}, want {want}",
+                set.label, inp[0], inp[1],
+            );
+        });
+    }
+}
