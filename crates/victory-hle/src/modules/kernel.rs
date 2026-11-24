@@ -106,9 +106,8 @@ pub extern "system" fn LoadLibraryExA(
     file: *mut c_void,
     flags: u32,
 ) -> *mut c_void {
-    let runs = runs_code(flags);
     if !name.is_null()
-        && let Some(handle) = find_module(&narrow(name), runs, runs)
+        && let Some(handle) = find_module(&narrow(name), runs_code(flags), maps_code(flags))
     {
         return handle;
     }
@@ -121,9 +120,8 @@ pub extern "system" fn LoadLibraryExW(
     file: *mut c_void,
     flags: u32,
 ) -> *mut c_void {
-    let runs = runs_code(flags);
     if !name.is_null()
-        && let Some(handle) = find_module(&wide(name), runs, runs)
+        && let Some(handle) = find_module(&wide(name), runs_code(flags), maps_code(flags))
     {
         return handle;
     }
@@ -135,6 +133,14 @@ pub extern "system" fn LoadLibraryExW(
 /// no code, so a title DLL we have not mapped can go to the host.
 fn runs_code(flags: u32) -> bool {
     flags & (0x1 | 0x2 | 0x20 | 0x40) == 0
+}
+
+/// False only for loads as data or resources (`LOAD_LIBRARY_AS_DATAFILE`
+/// (`_EXCLUSIVE`), `AS_IMAGE_RESOURCE`), which map no code: only those may
+/// take a DLL outside `HostPolicy` to the host. `DONT_RESOLVE_DLL_REFERENCES`
+/// alone still maps the image as code, which the title could then call.
+fn maps_code(flags: u32) -> bool {
+    flags & (0x2 | 0x20 | 0x40) == 0
 }
 
 pub extern "system" fn LoadLibraryA(name: *const u8) -> *mut c_void {
@@ -295,9 +301,10 @@ fn handle(m: &HleModule) -> *mut c_void {
 /// The title's images and our console modules by name; `None` leaves the
 /// name to the host, which only DLLs `HostPolicy` passes through get (as at
 /// import binding); others fail. With `load`, a title DLL not mapped yet is
-/// mapped now. Without `runs`, the load runs no code (a data-file load), so
-/// even a DLL outside `HostPolicy` goes to the host's loader.
-fn find_module(path: &str, load: bool, runs: bool) -> Option<*mut c_void> {
+/// mapped now. Without `maps_code`, the load maps no code (a data-file or
+/// resource load), so even a DLL outside `HostPolicy` goes to the host's
+/// loader.
+fn find_module(path: &str, load: bool, maps_code: bool) -> Option<*mut c_void> {
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
     // As the Windows loader does, a name without extension means a DLL.
     let file = if file.contains('.') {
@@ -330,7 +337,7 @@ fn find_module(path: &str, load: bool, runs: bool) -> Option<*mut c_void> {
         }
         return Some(handle(m));
     }
-    if host_dll || !runs {
+    if host_dll || !maps_code {
         return None;
     }
     // Any other host DLL (wininet, urlmon, ...) is beyond what we guard, and
@@ -698,5 +705,14 @@ mod tests {
         let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
         assert!(!data.is_null(), "last error {error}");
         assert_eq!(FreeLibrary(data), 1);
+    }
+
+    /// `DONT_RESOLVE_DLL_REFERENCES` runs no initialiser but still maps the
+    /// DLL as code the title could call, so it stays refused.
+    #[cfg(windows)]
+    #[test]
+    fn an_unresolved_code_load_of_a_host_dll_stays_refused() {
+        let code = LoadLibraryExW(w("comctl32.dll").as_ptr(), std::ptr::null_mut(), 0x1);
+        assert!(code.is_null());
     }
 }
