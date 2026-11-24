@@ -4,8 +4,10 @@
 
 use std::ffi::{c_char, c_void};
 
+#[cfg(windows)]
+use super::xgameruntime::put;
 use super::xgameruntime::{
-    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, put, text,
+    Guid, HRESULT, Interface, Methods, NOT_SUPPORTED, Object, add_ref, missing, text,
 };
 
 /// HDR mode; asked for with this interface id since 2020.
@@ -73,10 +75,18 @@ extern "system" fn launch_uri(_: This, _user: *const c_void, uri: *const c_char)
     NOT_SUPPORTED
 }
 
-/// A deferral keeps the host display on, as on the console, through a
-/// power request; the handle is that request.
+#[cfg(windows)]
+static NOOP_DEFERRAL: u8 = 0;
+
+#[cfg(windows)]
+fn noop_deferral_handle() -> *mut c_void {
+    std::ptr::from_ref(&NOOP_DEFERRAL).cast_mut().cast()
+}
+
+/// A deferral keeps the host display on through a power request when supported.
 #[cfg(windows)]
 extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Power::{
         PowerCreateRequest, PowerRequestDisplayRequired, PowerSetRequest,
     };
@@ -94,36 +104,71 @@ extern "system" fn acquire_deferral(_: This, out: *mut *mut c_void) -> HRESULT {
     context.Reason.SimpleReasonString = reason.as_mut_ptr();
     // SAFETY: a valid context; the string is copied by the call.
     let request = unsafe { PowerCreateRequest(&context) };
-    if request as isize == -1 {
-        return last_error();
+    if request == INVALID_HANDLE_VALUE {
+        return hresult_from_win32(last_error_code());
     }
     // SAFETY: the request we just created.
     if unsafe { PowerSetRequest(request, PowerRequestDisplayRequired) } == 0 {
-        let hr = last_error();
-        // SAFETY: as above; not handed out.
-        unsafe { windows_sys::Win32::Foundation::CloseHandle(request) };
-        return hr;
+        return finish_failed_deferral(out, request, last_error_code(), |request| {
+            // SAFETY: this is the valid request created above, which has not been handed out.
+            unsafe { CloseHandle(request) };
+        });
     }
     put(out, request)
+}
+
+#[cfg(windows)]
+fn finish_failed_deferral(
+    out: *mut *mut c_void,
+    request: *mut c_void,
+    error: u32,
+    close_request: impl FnOnce(*mut c_void),
+) -> HRESULT {
+    use windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED;
+
+    close_request(request);
+    if error != ERROR_NOT_SUPPORTED {
+        return hresult_from_win32(error);
+    }
+
+    static LOG_UNSUPPORTED: std::sync::Once = std::sync::Once::new();
+    LOG_UNSUPPORTED.call_once(|| {
+        tracing::info!(
+            "Display power request deferrals are unsupported on this host. Using a no-op deferral handle."
+        );
+    });
+    put(out, noop_deferral_handle())
 }
 
 #[cfg(windows)]
 extern "system" fn close_deferral(_: This, handle: *mut c_void) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Power::{PowerClearRequest, PowerRequestDisplayRequired};
-    if !handle.is_null() {
+    close_deferral_with(handle, |handle| {
         // SAFETY: a request from `acquire_deferral`.
         unsafe {
             PowerClearRequest(handle, PowerRequestDisplayRequired);
             CloseHandle(handle);
         }
-    }
+    });
 }
 
 #[cfg(windows)]
-fn last_error() -> HRESULT {
+fn close_deferral_with(handle: *mut c_void, release_request: impl FnOnce(*mut c_void)) {
+    if handle.is_null() || handle == noop_deferral_handle() {
+        return;
+    }
+    release_request(handle);
+}
+
+#[cfg(windows)]
+fn last_error_code() -> u32 {
     // SAFETY: no preconditions.
-    let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    unsafe { windows_sys::Win32::Foundation::GetLastError() }
+}
+
+#[cfg(windows)]
+fn hresult_from_win32(code: u32) -> HRESULT {
     (0x8007_0000 | (code & 0xffff)) as i32
 }
 
@@ -173,7 +218,9 @@ static CAPTURE_VTABLE: Methods<6> = Methods([
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use crate::modules::xasync::E_INVALIDARG;
     use crate::modules::xgameruntime::{S_OK, method};
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_NOT_SUPPORTED};
 
     #[test]
     fn sdr_and_display_deferrals() {
@@ -191,5 +238,48 @@ mod tests {
         );
         assert!(!handle.is_null());
         method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+    }
+
+    #[test]
+    fn unsupported_display_deferral_uses_noop_handle() {
+        let mut request_storage = 0_u8;
+        let request = std::ptr::from_mut(&mut request_storage).cast();
+        let mut handle = std::ptr::null_mut();
+        let mut closed = None;
+        let hr = finish_failed_deferral(&mut handle, request, ERROR_NOT_SUPPORTED, |request| {
+            closed = Some(request);
+        });
+
+        assert_eq!(closed, Some(request));
+        assert_eq!(hr, S_OK);
+        assert!(!handle.is_null());
+        assert_eq!(handle, noop_deferral_handle());
+        close_deferral_with(handle, |_| panic!("no-op deferral must not reach the OS"));
+        close_deferral_with(std::ptr::null_mut(), |_| {
+            panic!("null deferral must not reach the OS");
+        });
+    }
+
+    #[test]
+    fn display_deferral_access_denied_closes_request_and_returns_error() {
+        let mut request_storage = 0_u8;
+        let request = std::ptr::from_mut(&mut request_storage).cast();
+        let mut handle = std::ptr::null_mut();
+        let mut closed = None;
+        let hr = finish_failed_deferral(&mut handle, request, ERROR_ACCESS_DENIED, |request| {
+            closed = Some(request);
+        });
+
+        assert_eq!(closed, Some(request));
+        assert_eq!(hr, 0x8007_0005_u32 as HRESULT);
+        assert!(handle.is_null());
+    }
+
+    #[test]
+    fn display_deferral_rejects_null_output() {
+        assert_eq!(
+            acquire_deferral(&SHELL_OBJECT, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
     }
 }
