@@ -42,6 +42,9 @@ impl Default for HostPolicy {
             "api-ms-win-shcore-*",
             "msvcp_win.dll",
             "ole32.dll",
+            // BSTR helpers, imported by ordinal (4 SysAllocStringLen, 6
+            // SysFreeString) by the C++/CX runtime, vccorlib140.dll.
+            "oleaut32.dll",
             "advapi32.dll",
             "iphlpapi.dll",
             // The title's crash handler writes minidumps with it (loaded by name).
@@ -144,5 +147,26 @@ mod imp {
 mod imp {
     pub(super) fn resolve(_dll: &str, _symbol: &victory_pe::ImportSymbol) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// vccorlib140.dll imports OLEAUT32 by ordinal only; those ordinals must
+    /// reach the host's BSTR functions, not a trap stub.
+    #[test]
+    fn oleaut32_ordinals_are_the_bstr_functions() {
+        let policy = HostPolicy::default();
+        for (ordinal, name) in [(4, "SysAllocStringLen"), (6, "SysFreeString")] {
+            let found = policy.resolve("OLEAUT32.dll", &ImportSymbol::Ordinal(ordinal));
+            assert!(found.is_some(), "#{ordinal} unresolved");
+            assert_eq!(
+                found,
+                function("oleaut32.dll", name),
+                "#{ordinal} is not {name}"
+            );
+        }
     }
 }
