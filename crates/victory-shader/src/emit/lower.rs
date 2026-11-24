@@ -4116,13 +4116,23 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cvt_i32_f32" | "v_cvt_u32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
-                let mut a = f(self, 0)?;
-                if name == "v_cvt_rpi_i32_f32" {
-                    let h = self.s.m.f32(0.5f32.to_bits());
-                    a = self.s.m.bin(c, Bin::Add, a, h);
-                }
+                let x = f(self, 0)?;
+                let mut a = x;
                 if name != "v_cvt_i32_f32" && name != "v_cvt_u32_f32" {
-                    a = self.unary(27, a);
+                    a = self.unary(27, x);
+                    if name == "v_cvt_rpi_i32_f32" {
+                        // floor(x + 0.5) of the exact sum, which a float
+                        // sum rounds first (0.5 - 2^-25 would give 1, and
+                        // 2^23 + 1 the even number above it): one above
+                        // the floor from half a step on. x - floor(x) is
+                        // exact.
+                        let (h, one) = (0.5f32.to_bits(), 1f32.to_bits());
+                        let (h, one) = (self.s.m.f32(h), self.s.m.f32(one));
+                        let rest = self.s.m.bin(c, Bin::Sub, x, a);
+                        let up = self.s.m.cmp(c, pred::OGE, rest, h);
+                        let above = self.s.m.bin(c, Bin::Add, a, one);
+                        a = self.s.m.select(c, up, above, a);
+                    }
                 }
                 // D3D's conversions saturate and give 0 for NaN, as the
                 // hardware does (checked on the RX 6700 XT and WARP).

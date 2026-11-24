@@ -1385,3 +1385,75 @@ fn v_mul_legacy_f32_treats_denormals_as_zero() {
         );
     });
 }
+
+/// Runs VOP1 `op` on each input and compares the result dword.
+fn check_cvt(name: &str, op: u16, cases: &[(u32, u32)]) {
+    let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| [c.0, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got,
+            want,
+            "{backend}: {name}({:#010x} = {:e}) = {got:#010x}, want {want:#010x}",
+            inp[0],
+            f32::from_bits(inp[0]),
+        );
+    });
+}
+
+#[test]
+fn v_cvt_rpi_i32_f32_rounds_to_nearest() {
+    // floor(x + 0.5) of the exact sum: an f32 sum rounds to even first, so
+    // it is 1 too high just below 0.5 and for odd integers from 2^23 up.
+    check_cvt(
+        "v_cvt_rpi_i32_f32",
+        0x00C,
+        &[
+            (0x0000_0000, 0),
+            (0x3EFF_FFFF, 0), // 0.5 - 2^-25
+            (0x3F00_0000, 1), // 0.5: ties go up
+            (0xBF00_0000, 0), // -0.5
+            (0xBF00_0001, 0xFFFF_FFFF),
+            (0x3FC0_0000, 2),           // 1.5
+            (0x4020_0000, 3),           // 2.5
+            (0xBFC0_0000, 0xFFFF_FFFF), // -1.5
+            (0xC020_0000, 0xFFFF_FFFE), // -2.5
+            (0x0000_0001, 0),           // denormals, flushed or not
+            (0x8000_0001, 0),
+            (0x4A80_0001, 0x0040_0001), // 2^22 + 0.5
+            (0x4B00_0001, 0x0080_0001), // 2^23 + 1
+            (0x4B7F_FFFF, 0x00FF_FFFF), // 2^24 - 1
+            (0xCB00_0001, 0xFF7F_FFFF), // -(2^23 + 1)
+            (0xCB7F_FFFF, 0xFF00_0001),
+            (0x4EFF_FFFF, 0x7FFF_FF80),
+            (0x4F00_0000, 0x7FFF_FFFF), // 2^31 and up saturate
+            (0x7F80_0000, 0x7FFF_FFFF),
+            (0xCF00_0000, 0x8000_0000),
+            (0xCF00_0001, 0x8000_0000),
+            (0xFF80_0000, 0x8000_0000),
+        ],
+    );
+}
+
+#[test]
+fn v_cvt_flr_i32_f32_rounds_down() {
+    check_cvt(
+        "v_cvt_flr_i32_f32",
+        0x00D,
+        &[
+            (0x0000_0000, 0),
+            (0x8000_0000, 0),
+            (0x3FC0_0000, 1),           // 1.5
+            (0xBFC0_0000, 0xFFFF_FFFE), // -1.5
+            (0x3F7F_FFFF, 0),
+            (0xBF80_0000, 0xFFFF_FFFF), // -1
+            (0xB300_0000, 0xFFFF_FFFF), // -2^-25
+            (0x4B7F_FFFF, 0x00FF_FFFF),
+            (0x4F00_0000, 0x7FFF_FFFF),
+            (0x7F80_0000, 0x7FFF_FFFF),
+            (0xCF00_0001, 0x8000_0000),
+            (0xFF80_0000, 0x8000_0000),
+        ],
+    );
+}
