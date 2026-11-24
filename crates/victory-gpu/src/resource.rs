@@ -858,12 +858,28 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    // NVIDIA GPUs reject packed 16-bit color formats (B5G5R5A1_UNORM = 86,
+    // B4G4R4A4_UNORM = 115) with RENDER_TARGET or UNORDERED_ACCESS, which
+    // turns every view into a null descriptor. Store them as R16_TYPELESS
+    // (same 16 bpp) so the host texture exists.
+    const RENDER_TARGET: u32 = 1;
+    const R16_TYPELESS: u32 = 53;
+    const R16_UNORM: u32 = 56;
+    let packed16_fallback =
+        matches!(d.format, 86 | 115) && d.flags & (RENDER_TARGET | UNORDERED) != 0;
+    if packed16_fallback {
+        d.format = R16_TYPELESS;
+    }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        value[0] = if packed16_fallback {
+            R16_UNORM
+        } else {
+            pc_format(value[0])
+        };
         value
     });
     let heap = D3D12_HEAP_PROPERTIES {

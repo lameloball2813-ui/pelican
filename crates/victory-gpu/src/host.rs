@@ -755,8 +755,20 @@ impl Host {
         unsafe {
             let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.rtv_size) as usize;
+            let res_desc = resource.GetDesc();
+            let mut patched = desc.copied();
+            if res_desc.Format == DXGI_FORMAT_R16_TYPELESS {
+                let d = patched.get_or_insert_with(|| D3D12_RENDER_TARGET_VIEW_DESC {
+                    Format: DXGI_FORMAT_R16_UNORM,
+                    ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                    ..Default::default()
+                });
+                if matches!(d.Format.0, 0 | 86 | 115) {
+                    d.Format = DXGI_FORMAT_R16_UNORM;
+                }
+            }
             self.device
-                .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
+                .CreateRenderTargetView(resource, patched.as_ref().map(|d| d as *const _), handle);
             handle
         }
     }
