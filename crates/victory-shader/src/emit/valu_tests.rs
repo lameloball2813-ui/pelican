@@ -335,6 +335,82 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
     }
 }
 
+/// The f16 forms share the f32 forms' helper (operands widened first): -0
+/// still orders below +0.
+#[test]
+fn f16_max_and_min_order_negative_zero_below_positive_zero() {
+    let (pz, nz) = (0_u32, 0x8000_u32);
+    let cases = [
+        [nz, pz, nz, 0],
+        [pz, nz, nz, 0],
+        [nz, pz, pz, 0],
+        [pz, nz, pz, 0],
+    ];
+    let ops = [
+        ("v_max_f16", 0x139, pz),
+        ("v_min_f16", 0x13A, nz),
+        ("v_max3_f16", 0x354, pz),
+        ("v_min3_f16", 0x351, nz),
+    ];
+    for (name, op, want) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            assert_eq!(
+                got & 0xFFFF,
+                want,
+                "{backend}: {name} {inp:x?} = {got:#010x}"
+            );
+        });
+    }
+}
+
+/// Integer three-way minimum, maximum and median, where signed and unsigned
+/// order the same bits differently.
+#[test]
+fn integer_min3_max3_med3_match_rdna2() {
+    let inputs: Vec<[u32; 4]> = [
+        [5, 3, 9],
+        [7, 7, 2],
+        [0xFFFF_FFFF, 1, 0x8000_0000],
+        [0x7FFF_FFFF, 0x8000_0000, 0],
+        [0, 0xFFFF_FFFE, 0xFFFF_FFFF],
+        [0x8000_0000, 0x8000_0000, 0x7FFF_FFFF],
+    ]
+    .iter()
+    .map(|&[a, b, c]| [a, b, c, 0])
+    .collect();
+
+    // Sorted operands, then the one the instruction picks.
+    fn pick(inp: [u32; 4], signed: bool, which: usize) -> u32 {
+        let mut v = [inp[0], inp[1], inp[2]];
+        if signed {
+            v.sort_by_key(|&x| x as i32);
+        } else {
+            v.sort();
+        }
+        v[which]
+    }
+    let ops = [
+        ("v_min3_i32", 0x152, true, 0),
+        ("v_min3_u32", 0x153, false, 0),
+        ("v_max3_i32", 0x155, true, 2),
+        ("v_max3_u32", 0x156, false, 2),
+        ("v_med3_i32", 0x158, true, 1),
+        ("v_med3_u32", 0x159, false, 1),
+    ];
+    for (name, op, signed, which) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &inputs, |backend, _, inp, got| {
+            let want = pick(inp, signed, which);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1], inp[2],
+            );
+        });
+    }
+}
+
 #[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)
@@ -864,6 +940,28 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             got, want,
             "{backend}: v_bfe_u32({:#010x}, {}, {}) = {got:#010x}, want {want:#010x}",
             inp[0], inp[1], inp[2],
+        );
+    });
+
+    // s_bfe_u32 s6, s0, s1 (SOP2 opcode 0x27); v_mov_b32 v0, s6. Its width
+    // is 7-bit too: 32..127 keeps every bit from the offset up, unextended.
+    let s_unsigned = build_valu_cs(&[sop2(0x27, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+    let mut su_cases = unsigned_cases.to_vec();
+    su_cases.extend([
+        ([0x8000_0000, 4, 32, 0], 0x0800_0000),
+        ([0xFFFF_FFFF, 0, 127, 0], 0xFFFF_FFFF),
+        ([0xF000_0000, 28, 64, 0], 0x0000_000F),
+    ]);
+    let su_in: Vec<[u32; 4]> = su_cases
+        .iter()
+        .map(|&(inp, _)| [inp[0], (inp[1] & 31) | ((inp[2] & 0x7F) << 16), 0, 0])
+        .collect();
+    run_cases(&s_unsigned, &su_in, |backend, i, inp, got| {
+        let want = su_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: s_bfe_u32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
         );
     });
 }
