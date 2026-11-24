@@ -8276,6 +8276,11 @@ mod tests {
                 0,
                 "ATOMIC_INT64_ON_TYPED_RESOURCE feature bit missing"
             );
+            assert_ne!(
+                features & 0x1000_0000,
+                0,
+                "ATOMIC_INT64_ON_DESCRIPTOR_HEAP_RESOURCE feature bit missing"
+            );
         }
     }
 
