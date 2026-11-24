@@ -62,6 +62,10 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// The host's limit for shader-visible sampler heaps across all resource
+/// binding tiers (D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE).
+const PORTABLE_SAMPLERS: u32 = 2_048;
+
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
@@ -96,10 +100,16 @@ impl HostHeap {
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
         let (heap, count, extra) = if sampler {
-            match make(count) {
-                Ok(heap) => (heap, count, 0),
+            let actual = if count > PORTABLE_SAMPLERS {
+                tracing::warn!(count, "host sampler heap capped at {PORTABLE_SAMPLERS}");
+                PORTABLE_SAMPLERS
+            } else {
+                count
+            };
+            match make(actual) {
+                Ok(heap) => (heap, actual, 0),
                 Err(e) => {
-                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    tracing::warn!(error = %e, count = actual, sampler, "no host descriptor heap");
                     return None;
                 }
             }
@@ -972,5 +982,23 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A sampler heap larger than 2,048 is capped to PORTABLE_SAMPLERS (2,048).
+    #[test]
+    fn sampler_heap_over_limit_is_capped_to_portable_samplers() {
+        let Some(_host) = host() else {
+            return; // no host GPU
+        };
+        // 4096 exceeds D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE (2048)
+        let heap = HostHeap::new(true, 4096).expect("sampler heap capped at 2048 should succeed");
+        assert_eq!(heap.count, PORTABLE_SAMPLERS);
+        assert_eq!(heap.dynamic, 0);
+        assert!(heap.sampler);
+
+        let heap_normal = HostHeap::new(true, 16).expect("normal sampler heap should succeed");
+        assert_eq!(heap_normal.count, 16);
+        assert_eq!(heap_normal.dynamic, 0);
+        assert!(heap_normal.sampler);
     }
 }
