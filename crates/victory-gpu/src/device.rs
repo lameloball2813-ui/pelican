@@ -345,9 +345,46 @@ extern "system" fn check_feature_support(
         MULTISAMPLE => {
             // SAFETY: checked size and non-null.
             let q = unsafe { &mut *data.cast::<[u32; 4]>() };
-            // Format, sample count, flags in; one quality level out for the
-            // counts the hardware has.
-            q[3] = u32::from(matches!(q[1], 1 | 2 | 4 | 8));
+            // Guest texture layouts support powers of two up to eight samples.
+            if !matches!(q[1], 1 | 2 | 4 | 8) {
+                q[3] = 0;
+                return S_OK;
+            }
+            #[cfg(windows)]
+            if let Some(host) = crate::host::host() {
+                use windows::Win32::Graphics::Direct3D12::{
+                    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS,
+                    D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS,
+                };
+                use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+
+                // These guest formats have no host mapping. PC formats
+                // 189–191 describe unrelated data.
+                if matches!(q[0], 116 | 117 | 189..=191) {
+                    q[3] = 0;
+                    return S_OK;
+                }
+                let mut support = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS {
+                    Format: DXGI_FORMAT(resource::pc_format(q[0]) as i32),
+                    SampleCount: q[1],
+                    Flags: D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS(q[2] as i32),
+                    NumQualityLevels: 0,
+                };
+                // SAFETY: the structure and size match the native multisample query.
+                if let Err(error) = unsafe {
+                    host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                        (&raw mut support).cast(),
+                        size_of::<D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS>() as u32,
+                    )
+                } {
+                    return error.code().0;
+                }
+                q[3] = support.NumQualityLevels;
+                return S_OK;
+            }
+            // Keep the fallback for runs without a host device.
+            q[3] = 1;
             S_OK
         }
         _ => feature_levels(data),
