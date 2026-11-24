@@ -44,18 +44,19 @@ Open VIctory pull requests merged here as well (their authors' commits):
 #596, #605, #606, #615, #621, #636, #646, #663, #674.
 
 Merged by hand where they overlapped what was already here (each commit
-says what was combined): #578, #583, #589, #599, #608, #651, #660, #694,
-#705, #708. Their tests were brought up to date where they called old
+says what was combined): #578, #583, #584, #589, #599, #608, #624, #626,
+#635, #641, #650, #651, #660, #673, #683, #687, #688, #694, #705, #708. Their tests were brought up to date where they called old
 helpers (`resource::track` now takes the structure; `lowers` takes `rsrc2`).
 
 #578 refuses wave64 mesh and compute programs on GPUs without 64-lane waves
 (NVIDIA): per VIctory #778 that stops the world-entry GPU hang there, and the
 world then renders without those programs instead.
 
-Not merged yet: #584, #626, #635, #641, #650, #655, #673, #683, #687, #688,
-#624 (conflicts not yet resolved); #632, #628, #707 (rework the shared GPU
-test harness differently from what is here); #668 (a different
-`v_cvt_u16/i16_f16` lowering than the one already here).
+Not merged: #632, #628, #707 (rework the shared GPU test harness
+differently from what is here); #668 (a different `v_cvt_u16/i16_f16`
+lowering than the one already here); #655 (guards conditional exports
+differently from #587's mesh output bounds, already here). Each needs its
+author's rebase or a decision between the two behaviours.
 
 Pelican's own fixes for VIctory issues: #811 (OLEAUT32 BSTR functions) and
 hardware tests for #800, #802, #803.
