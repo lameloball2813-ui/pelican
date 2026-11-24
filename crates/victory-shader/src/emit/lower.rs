@@ -5818,7 +5818,9 @@ impl<'a> Lower<'a> {
                 // On a host wave wider than the console's the upper half is a
                 // second console wave: `lo` counts bits of the lane's own
                 // half's mask below its lane in it, and a wave32 mask's high
-                // half is empty.
+                // half is empty. The count is a lane number, and lane numbers
+                // stay host lanes: a second wave's rank takes its 32-lane
+                // base, so `v_mbcnt_lo(-1)` is still the lane index.
                 let host_halves = self.mask_data == MaskData::Host && !self.x.native.wave64;
                 let lane = self.lane_index();
                 let below = if name == "v_mbcnt_lo_u32_b32" {
@@ -5849,6 +5851,12 @@ impl<'a> Lower<'a> {
                 let n = self
                     .s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[x]);
+                let n = if host_halves && name == "v_mbcnt_lo_u32_b32" {
+                    let base = self.s.m.bin(c, Bin::And, lane, k32);
+                    self.s.m.bin(c, Bin::Add, n, base)
+                } else {
+                    n
+                };
                 self.s.m.bin(c, Bin::Add, n, b)
             }
             _ => return Err(name),
@@ -8004,7 +8012,8 @@ mod tests {
 
     /// A wave32 graphics program's host wave may have 64 lanes, whose upper
     /// half is a second console wave: a lane mask read as a number picks the
-    /// reader's half of the ballot.
+    /// reader's half of the ballot, and `v_mbcnt_lo` reports its rank as a
+    /// host lane number.
     #[test]
     fn a_wave32_mask_read_takes_its_ballot_half() {
         let words = [
@@ -8016,10 +8025,12 @@ mod tests {
             0x0001_006A, // v_mbcnt_lo_u32_b32 v5, vcc_lo, 0
             0xD766_0006,
             0x0002_0A6A, // v_mbcnt_hi_u32_b32 v6, vcc_lo, v5
+            0xD765_0007,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v7, -1, 0
             0xBF85_0001, // s_cbranch_scc1 -> the export
             S_ENDPGM,    // no lane had its bit: done
             0xF800_180F,
-            0x0406_0504, // exp mrt0, v4, v5, v6, v4 done vm
+            0x0706_0504, // exp mrt0, v4, v5, v6, v7 done vm
             S_ENDPGM,
         ];
         let lowered = lower_program(&words, HwStage::Ps, false, pixel_io()).unwrap();
@@ -8062,6 +8073,29 @@ mod tests {
             "no `lane & 31` in {l:?}"
         );
         at(l, &format!("call f{bits} [k31, k0]"));
+        // The count is a lane number, so a second wave's rank takes its
+        // 32-lane base: `v_mbcnt_lo(-1)` is the host lane index.
+        let bases: Vec<usize> = l
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                s.starts_with("bin:And ")
+                    && lanes.iter().any(|n| **s == format!("bin:And i{n} k32"))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!bases.is_empty(), "no `lane & 32` wave base in {l:?}");
+        for base in &bases {
+            assert!(
+                l.iter().any(|s| {
+                    s.starts_with("bin:Add ")
+                        && s["bin:Add ".len()..]
+                            .split(' ')
+                            .any(|a| a == format!("i{base}"))
+                }),
+                "the wave base `i{base}` is never added in {l:?}"
+            );
+        }
     }
 
     /// The ballot-half pick is for wave32 graphics programs only: a wave64
