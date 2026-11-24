@@ -733,11 +733,13 @@ extern "system" fn heap_query(this: This, iid: *const Iid, out: *mut This) -> HR
 extern "system" fn heap_release(this: This) -> u32 {
     object::release_boxed::<Heap>(this)
 }
-extern "system" fn heap_desc(this: This, out: *mut HeapDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn heap_desc(this: This, out: *mut HeapDesc) -> *mut HeapDesc {
     if !out.is_null() {
         // SAFETY: `this` is a heap; the title passes room for a description.
         unsafe { out.write((*this.cast::<Heap>()).desc) };
     }
+    out
 }
 
 /// A resource's memory: its own, or a range of a heap it holds a reference
@@ -1271,7 +1273,8 @@ extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *m
     S_OK
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
-extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
+/// Returns `out`, as the x64 COM ABI requires for struct returns in `RAX`.
+extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) -> *mut ResourceDesc {
     if !out.is_null() {
         let mut desc = resource(this).desc;
         if desc.dimension != BUFFER && desc.mip_levels == 0 {
@@ -1280,6 +1283,7 @@ extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
         // SAFETY: checked non-null; the title passes room for a description.
         unsafe { out.write(desc) };
     }
+    out
 }
 /// Device method `GetCustomHeapProperties`, returning its struct through a
 /// hidden first argument: what a standard heap type is as a custom heap.
@@ -1445,9 +1449,12 @@ mod tests {
         let memory = unsafe { &(*heap.cast::<Heap>()).memory };
         assert_eq!(memory.ptr.as_ptr() as u64 % KIB_64, 0);
         let mut back = std::mem::MaybeUninit::<HeapDesc>::uninit();
-        slot::<extern "system" fn(This, *mut HeapDesc)>(heap, 0x40)(heap, back.as_mut_ptr());
+        type GetDesc = extern "system" fn(This, *mut HeapDesc) -> *mut HeapDesc;
+        let get_desc = slot::<GetDesc>(heap, 0x40);
+        assert_eq!(get_desc(heap, back.as_mut_ptr()), back.as_mut_ptr());
         // SAFETY: written above.
         assert_eq!(unsafe { back.assume_init() }.size, 1 << 20);
+        assert!(get_desc(heap, std::ptr::null_mut()).is_null());
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
 
         let bad = HeapDesc {
@@ -2050,6 +2057,14 @@ mod tests {
             &mut committed,
         );
         assert_eq!(hr, S_OK);
+        let mut back = std::mem::MaybeUninit::<ResourceDesc>::uninit();
+        type GetDesc = extern "system" fn(This, *mut ResourceDesc) -> *mut ResourceDesc;
+        let get_desc = slot::<GetDesc>(committed, 0x50);
+        assert_eq!(get_desc(committed, back.as_mut_ptr()), back.as_mut_ptr());
+        // SAFETY: written above.
+        let read = unsafe { back.assume_init() };
+        assert_eq!((read.dimension, read.width), (BUFFER, 256));
+        assert!(get_desc(committed, std::ptr::null_mut()).is_null());
         let mut data = std::ptr::null_mut();
         assert_eq!(
             slot::<Map>(committed, 0x40)(committed, 0, null.cast(), &mut data),
