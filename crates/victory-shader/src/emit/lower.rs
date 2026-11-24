@@ -175,6 +175,8 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Bytes each root view holds, by root parameter (see [`Self::root_view_size`]).
+    root_sizes: HashMap<usize, V>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     atomic_descriptor_loads: HashSet<Site>,
@@ -604,6 +606,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            root_sizes: HashMap::new(),
             samplers: Vec::new(),
             atomic_descriptor_loads: atomic_descriptor_loads(p, x.res),
             descriptors: x
@@ -760,6 +763,27 @@ impl<'a> Lower<'a> {
             };
             Some(self.handle((b, i), &src, false, (11, 0))?)
         };
+        // Root views: the dwords read checked against the view's size.
+        let root = if a.param == CODE {
+            None
+        } else {
+            self.root_view_size(&Source::Built {
+                address: a,
+                bits: 0,
+                words: [0, 0],
+            })
+        };
+        let (off, ok) = match root {
+            Some(size) => {
+                let bytes = if sub.is_some() { 4 } else { 4 * n };
+                let not3 = self.s.m.i32(!3);
+                let at = self.s.m.bin(c, Bin::And, off, not3);
+                let (ok, _) = self.in_root_view(size, at, bytes);
+                let zero = self.s.m.i32(0);
+                (self.s.m.select(c, ok, off, zero), Some(ok))
+            }
+            None => (off, None),
+        };
         let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
             match h {
                 None => l.code_dword(byte),
@@ -801,6 +825,7 @@ impl<'a> Lower<'a> {
                         .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left)
                 }
             };
+            let x = self.zero_unless(ok, x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
@@ -1324,6 +1349,93 @@ impl<'a> Lower<'a> {
             &[h, row],
         );
         Val::I32(self.s.m.extract(entry, r, index % 4))
+    }
+
+    /// For a root view (a root CBV, SRV or UAV), the bytes the host's view
+    /// holds from its start, which the host passes in the user-data dword of
+    /// the view's address. A root view has no bounds on the host: an access
+    /// past what the host mapped (an offset from data the host has not
+    /// mirrored) is a GPU page fault, which some hosts' GPUs stall on until
+    /// the driver resets the device. Accesses are checked against this size
+    /// as the console's bounded buffer views are.
+    fn root_view_size(&mut self, src: &Source) -> Option<V> {
+        let Source::Built { address, .. } = src else {
+            return None;
+        };
+        if address.param == CODE {
+            return None;
+        }
+        let rp = *self.x.native.layout.get(address.param)?;
+        if rp.root != RootType::Descriptor {
+            return None;
+        }
+        if let Some(&v) = self.root_sizes.get(&address.param) {
+            return Some(v);
+        }
+        let index = u32::from(rp.user_data);
+        self.user_reads.insert(
+            index,
+            UserData {
+                index,
+                slot: rp.slot,
+                root: RootType::Descriptor,
+                dword: 0,
+            },
+        );
+        self.s.user_data = self.s.user_data.max(index + 1);
+        let h = match self.user_data {
+            Some(h) => h,
+            None => {
+                let h = self.s.user_data_handle();
+                self.user_data = Some(h);
+                h
+            }
+        };
+        let entry = self.s.entry;
+        let row = self.s.m.i32(index / 4);
+        let r = self.s.op(
+            entry,
+            "cbufferLoadLegacy.i32",
+            Attr::ReadOnly,
+            self.s.t.cbuf_ret,
+            59,
+            &[h, row],
+        );
+        let v = self.s.m.extract(entry, r, index % 4);
+        self.root_sizes.insert(address.param, v);
+        Some(v)
+    }
+
+    /// Whether `bytes` bytes at byte `off` lie in a root view of `size`
+    /// bytes, and the offset to access instead (0 when they do not).
+    fn in_root_view(&mut self, size: V, off: V, bytes: u32) -> (V, V) {
+        let c = self.cur;
+        let below = self.s.m.cmp(c, pred::IULT, off, size);
+        let left = self.s.m.bin(c, Bin::Sub, size, off);
+        let n = self.s.m.i32(bytes);
+        let fits = self.s.m.cmp(c, pred::IUGE, left, n);
+        let ok = self.s.m.bin(c, Bin::And, below, fits);
+        let zero = self.s.m.i32(0);
+        (ok, self.s.m.select(c, ok, off, zero))
+    }
+
+    /// `guard` (lanes that run an access) narrowed to `ok`.
+    fn narrow(&mut self, guard: Option<V>, ok: Option<V>) -> Option<V> {
+        match (guard, ok) {
+            (Some(g), Some(k)) => Some(self.s.m.bin(self.cur, Bin::And, g, k)),
+            (g, k) => g.or(k),
+        }
+    }
+
+    /// `x` where `ok` holds, else 0 (`ok` none: always `x`).
+    fn zero_unless(&mut self, ok: Option<V>, x: V) -> V {
+        match ok {
+            Some(k) => {
+                let zero = self.s.m.i32(0);
+                self.s.m.select(self.cur, k, x, zero)
+            }
+            None => x,
+        }
     }
 
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
@@ -3319,6 +3431,7 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked descriptor")?;
         let kind = self.used_kind(src);
+        let size = self.root_view_size(src);
         let c = self.cur;
         let (base, extra) = self.built_offset(src)?;
         let offset = &((*offset as u32).wrapping_add(base) as i32);
@@ -3345,6 +3458,13 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
+                let (a, ok) = match size {
+                    Some(size) => {
+                        let (ok, a) = self.in_root_view(size, a, 4);
+                        (a, Some(ok))
+                    }
+                    None => (a, None),
+                };
                 let mask = self.s.m.i8(1);
                 let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
                 let r = self.s.op(
@@ -3357,6 +3477,7 @@ impl<'a> Lower<'a> {
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
+                let x = self.zero_unless(ok, x);
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -3396,7 +3517,14 @@ impl<'a> Lower<'a> {
                 None => {
                     let off = self.s.m.i32(4 * k);
                     let a = self.s.m.bin(c, Bin::Add, addr, off);
-                    self.cbuffer_dword(h, a)
+                    match size {
+                        Some(size) => {
+                            let (ok, a) = self.in_root_view(size, a, 4);
+                            let x = self.cbuffer_dword(h, a);
+                            self.zero_unless(Some(ok), x)
+                        }
+                        None => self.cbuffer_dword(h, a),
+                    }
                 }
             };
             self.write(inst, Reg::S(code + k as u8), x, None);
@@ -7005,10 +7133,19 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
+            let size = self.root_view_size(src);
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
+                let (a, ok) = match size {
+                    Some(size) => {
+                        let (ok, a) = self.in_root_view(size, a, 4);
+                        (a, Some(ok))
+                    }
+                    None => (a, None),
+                };
                 let x = self.cbuffer_dword(h, a);
+                let x = self.zero_unless(ok, x);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -7016,6 +7153,16 @@ impl<'a> Lower<'a> {
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
         let iu = self.s.m.undef(self.s.t.i32);
+        // Root views: the bytes accessed checked against the view's size
+        // (raw accesses, and the raw loads formatted ones make).
+        let (off, root_ok) = match self.root_view_size(src) {
+            Some(size) if !typed || format.is_some() => {
+                let bytes = if format.is_some() { 16 } else { 4 * count };
+                let (ok, at) = self.in_root_view(size, off, bytes);
+                (at, Some(ok))
+            }
+            _ => (off, None),
+        };
         if let Some(op) = atomic {
             let d = data.as_ref().ok_or("buffer atomic data")?;
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
@@ -7038,7 +7185,8 @@ impl<'a> Lower<'a> {
                 Some(v) if returns => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
-            let at = self.begin_guarded(guard);
+            let access = self.narrow(guard, root_ok);
+            let at = self.begin_guarded(access);
             let i32t = self.s.t.i32;
             let r = if op == u32::MAX {
                 // cmpswap: data is (new, compare).
@@ -7124,7 +7272,8 @@ impl<'a> Lower<'a> {
             if !typed {
                 args.push(self.s.m.i32(4));
             }
-            let at = self.begin_guarded(guard);
+            let access = self.narrow(guard, root_ok);
+            let at = self.begin_guarded(access);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.end_guarded(at, &[]);
@@ -7139,6 +7288,7 @@ impl<'a> Lower<'a> {
                 return Err("a buffer result");
             };
             for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
+                let x = self.zero_unless(root_ok, x);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -7221,6 +7371,7 @@ impl<'a> Lower<'a> {
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
             let x = self.as_int(x);
+            let x = self.zero_unless(root_ok, x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())

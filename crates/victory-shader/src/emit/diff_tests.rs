@@ -706,6 +706,9 @@ fn user_data(s: &HostShader, k: &[u32; 4]) -> Vec<u32> {
             (RootType::Table, 3) => 5 * 32,
             // The typed views of `raw` (compute) from 9.
             (RootType::Table, 6) => 9 * 32,
+            // The bytes of the root CBV (slot 4) and SRV (slot 5) bound.
+            (RootType::Descriptor, 4) => 64 * 4,
+            (RootType::Descriptor, 5) => 32 * 4,
             other => panic!("unexpected user data {other:?}"),
         };
     }

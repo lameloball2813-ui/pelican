@@ -142,9 +142,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         return None;
     }
     let shadow = crate::shadow::find(address, 1)?;
-    let len = shadow
-        .left(address)
-        .min(if srv { 1 << 20 } else { 1 << 16 });
+    let len = root_view_len(&shadow, address, srv);
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
@@ -155,6 +153,14 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
+}
+
+/// The bytes of title memory at `address` a root view binds (and shaders
+/// may read: see [`State::root_view_bytes`]).
+fn root_view_len(shadow: &crate::shadow::Shadow, address: u64, srv: bool) -> u64 {
+    shadow
+        .left(address)
+        .min(if srv { 1 << 20 } else { 1 << 16 })
 }
 
 macro_rules! once {
@@ -373,6 +379,21 @@ impl State {
         }
     }
 
+    /// The bytes root view `slot` holds from its start, as [`root_view`]
+    /// binds it. Shaders check their accesses against it: a root view has
+    /// no bounds on the host, and an access past the memory it maps is a
+    /// GPU page fault, which some hosts stall on until the driver resets
+    /// the device. 0 for a root view the title did not set.
+    fn root_view_bytes(&self, compute: bool, slot: u8, srv: bool) -> u32 {
+        let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) else {
+            return 0;
+        };
+        let Some(shadow) = crate::shadow::find(address, 1) else {
+            return 0;
+        };
+        u32::try_from(root_view_len(&shadow, address, srv)).unwrap_or(u32::MAX)
+    }
+
     /// The bound heap holding `handle`.
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
@@ -538,6 +559,10 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
+                        None if u.root == RootType::Descriptor => {
+                            let srv = stage.root_srvs.iter().any(|r| r.0 == u.slot);
+                            self.root_view_bytes(compute, u.slot, srv)
+                        }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }

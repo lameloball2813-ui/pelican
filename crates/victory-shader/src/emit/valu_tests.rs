@@ -1823,3 +1823,154 @@ fn v_cvt_pknorm_f16_rounds_the_exact_product() {
         });
     }
 }
+
+/// MUBUF `buffer_load_dword vdata, vaddr, s[srsrc:srsrc+3], 0 offen`.
+const fn buffer_load_dword_offen(vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x0C << 18 | 1 << 12,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// A root SRV has no bounds on the host: a read past what the host bound
+/// reads 0, as a console buffer view past its records does, instead of
+/// memory after it (or an unmapped page, which some GPUs stall on).
+#[test]
+fn root_view_reads_stop_at_the_bound_size() {
+    // s0..s3 root constants, s4 the UAV table, s[8:9] the root SRV's address.
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(12, 4));
+    // The buffer descriptor built around the root address: all records.
+    words.push(s_mov_b32(10, 0xC1));
+    words.push(s_mov_b32(11, 0x80));
+    words.push(vop1(0x001, 1, sgpr(0))); // v_mov_b32 v1, s0: the byte offset
+    words.extend_from_slice(&buffer_load_dword_offen(0, 1, 8));
+    words.extend_from_slice(&buffer_store_dword(0, 12, 0));
+    words.push(S_ENDPGM);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let root = |root, sgprs, user_data, slot| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let used = |kind, root, user_data, slot| UsedResource {
+        kind,
+        root,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data,
+        slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            root(RootType::Constants, 4, 0, 0),
+            root(RootType::Table, 1, 4, 1),
+            root(RootType::Descriptor, 2, 8, 2),
+        ],
+        used: vec![
+            used(ResourceType::Uav, RootType::Table, 4, 1),
+            used(ResourceType::Srv, RootType::Descriptor, 8, 2),
+        ],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 10 << 1, // 10 user SGPRs: s0..s9
+            threads: [1, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let st = structure::structure(&p).expect("structure");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+    };
+    assert_eq!(shader.root_srvs, [2]);
+    assert!(
+        shader
+            .user_data
+            .iter()
+            .any(|u| u.root == RootType::Descriptor && u.slot == 2 && u.index == 8),
+        "the root view's size is user data: {:?}",
+        shader.user_data
+    );
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    // 64 dwords bound, of which the host says 16 (64 bytes) are the view's.
+    let data: Vec<u32> = (0..64).map(|i| 0x100 + i).collect();
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        for (offset, want) in [
+            (0, 0x100),
+            (60, 0x10F),
+            (64, 0),
+            (128, 0),
+            (u32::MAX - 3, 0),
+        ] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match u.root {
+                    RootType::Constants => offset,
+                    RootType::Descriptor => 64,
+                    _ => 0,
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: data.clone(),
+                                },
+                            ),
+                        ],
+                        views: &[View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(out[0][0], want, "{label}: offset {offset:#x}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
