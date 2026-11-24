@@ -1,14 +1,23 @@
-# VIctory
+# Pelican
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
+Pelican is a fork of [VIctory](https://github.com/Marvisak/VIctory) by
+Marvisak and its contributors, and keeps its full history and its licence
+(GPL-3.0-or-later). All of VIctory's work is theirs; Pelican continues it.
+It is not an official VIctory release and is not endorsed by its authors.
+
+What Pelican changes is listed in [PELICAN.md](PELICAN.md). Package and crate
+names (`victory-*`) and the `VICTORY_*` environment variables are kept as they
+are, so VIctory's changes keep merging in cleanly.
+
+The title's x86-64 code runs unchanged inside our process; the runtime supplies
 the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
 
-## Status (2026-11-23)
+## Status (inherited from VIctory, 2026-11-23)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and
 loads the world, where rendering fails.
@@ -66,11 +75,11 @@ Run the title:
 
 ```powershell
 cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+target\release\pelican.exe run <game dir>\<the title's exe> --execute
 ```
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
+are kept under the data folder (default `%LOCALAPPDATA%\pelican\data`), derived
 data under the cache folder.
 
 Input: XInput pads. With none connected the keyboard is a pad while the
@@ -88,14 +97,14 @@ title's window has focus:
 ## Commands
 
 ```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
+pelican inspect <exe|dll> [--imports] [--exports]
+pelican census [paths...] [--missing] [--strict]
+pelican lib-exports <import.lib> [--list]
+pelican shader-info [paths...] [--verbose] [--disasm]
+pelican translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+pelican run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
-victory config
+pelican config
 ```
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
@@ -106,7 +115,7 @@ info and above).
 A release build has no debugging aids. Build them in with
 
 ```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
+cargo build --profile diag -p victory --features diagnostics   # target\diag\pelican.exe
 ```
 
 | Variable | Effect |

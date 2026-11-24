@@ -7,6 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# Pelican keeps VIctory's package and crate names so upstream changes merge
+# cleanly; only the executable is renamed.
+[[bin]]
+name = "pelican"
+path = "src/main.rs"
+
 [dependencies]
 victory-core.workspace = true
 victory-pe.workspace = true

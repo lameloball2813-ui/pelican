@@ -126,14 +126,15 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG or home cache).
+/// `%LOCALAPPDATA%/pelican/<name>` (elsewhere the XDG or home cache). Kept
+/// apart from VIctory's folder so the two never share saves or caches.
 fn default_dir(name: &str) -> Result<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
         .context("cannot determine a user directory; set VICTORY_CACHE_DIR and VICTORY_DATA_DIR")?;
-    Ok(base.join("victory").join(name))
+    Ok(base.join("pelican").join(name))
 }
 
 #[cfg(test)]
