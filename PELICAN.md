@@ -40,8 +40,11 @@ reading them and running the tests on an RTX 5060 Ti and WARP.
 
 Open VIctory pull requests merged here as well (their authors' commits):
 #588, #590, #592, #601, #613, #616, #618, #629, #633, #640, #648, #652, #658,
-#659, #661, #662, #664, #665, #670, #679, #682, #689. Not merged yet, as they
-conflict with the fixes above or no longer build: #584, #635, #655, #673, #683.
+#659, #661, #662, #664, #665, #670, #679, #682, #689, #577, #581, #585, #587,
+#605, #606, #615, #621, #636, #646, #663, #674. Not merged yet, as they
+conflict with the fixes above or no longer build: #584, #635, #655, #673, #683,
+#578, #583, #589, #599, #608, #624, #626, #632, #641, #650, #651, #660, #668,
+#687, #688, #694, #705, #708.
 
 Pelican's own fixes for VIctory issues: #811 (OLEAUT32 BSTR functions) and
 hardware tests for #800, #802, #803.
