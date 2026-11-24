@@ -1746,6 +1746,45 @@ impl<'a> Lower<'a> {
         self.vals.insert(new, Val::I32(x));
     }
 
+    /// The two register offsets of `v_movrelsd_2_b32` and `v_swaprel_b32`:
+    /// M0[9:0] for the source, M0[25:16] for the destination.
+    fn m0_halves(&mut self, m0: V) -> (V, V) {
+        let c = self.cur;
+        let low = self.s.m.i32(0x3FF);
+        let sixteen = self.s.m.i32(16);
+        let si = self.s.m.bin(c, Bin::And, m0, low);
+        let high = self.s.m.bin(c, Bin::LShr, m0, sixteen);
+        let di = self.s.m.bin(c, Bin::And, high, low);
+        (si, di)
+    }
+
+    /// `v[base + index]`, from the M0-relative range `inst` reads from
+    /// `base` on ([`crate::ir`] names it up to the program's VGPR count);
+    /// 0 past it.
+    fn rel_read(&mut self, inst: &Inst, base: u8, index: V) -> Result<V, Why> {
+        let c = self.cur;
+        let mut r = self.s.m.i32(0);
+        for k in 0..=255u8.saturating_sub(base) {
+            let Some(x) = inst.read(Reg::V(base + k)) else {
+                break;
+            };
+            let x = self.i32_of(x)?;
+            let kk = self.s.m.i32(u32::from(k));
+            let is = self.s.m.cmp(c, pred::EQ, index, kk);
+            r = self.s.m.select(c, is, x, r);
+        }
+        Ok(r)
+    }
+
+    /// The value a VGPR an M0-relative write may land on held before it
+    /// (0 when the program never set it).
+    fn old_vgpr(&mut self, inst: &Inst, reg: u8) -> Result<V, Why> {
+        match inst.read(Reg::V(reg)) {
+            Some(o) => self.i32_of(o),
+            None => Ok(self.s.m.i32(0)),
+        }
+    }
+
     /// The SDWA destination selection: a byte or word, and what the other
     /// bits get (0 zeros, 1 the sign above the field, 2 the old bits).
     fn sdwa_dst(inst: &Inst) -> Option<(u8, u8)> {
@@ -3823,10 +3862,12 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
-            "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" => {
+            "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" | "v_movrelsd_2_b32" => {
                 // M0 indexes the source (movrels), the destination (movreld)
                 // or both, from the encoded register up to the program's
                 // VGPR count (the registers the instruction reads or writes).
+                // movrelsd_2 indexes them apart: the source by M0[9:0], the
+                // destination by M0[25:16].
                 let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
                 let (
                     Some(&Operand::Vector { reg: sreg, .. }),
@@ -3835,19 +3876,13 @@ impl<'a> Lower<'a> {
                 else {
                     return Err("an M0-relative move");
                 };
-                let indexed_src = name != "v_movreld_b32";
-                let value = if indexed_src {
-                    let mut r = self.s.m.i32(0);
-                    for k in 0..=255u8.saturating_sub(sreg) {
-                        let Some(x) = inst.read(Reg::V(sreg + k)) else {
-                            break;
-                        };
-                        let x = self.i32_of(x)?;
-                        let kk = self.s.m.i32(u32::from(k));
-                        let is = self.s.m.cmp(c, pred::EQ, m0, kk);
-                        r = self.s.m.select(c, is, x, r);
-                    }
-                    r
+                let (si, di) = if name == "v_movrelsd_2_b32" {
+                    self.m0_halves(m0)
+                } else {
+                    (m0, m0)
+                };
+                let value = if name != "v_movreld_b32" {
+                    self.rel_read(inst, sreg, si)?
                 } else {
                     s(self, 0)?
                 };
@@ -3858,14 +3893,48 @@ impl<'a> Lower<'a> {
                     let Some(_) = inst.write(Reg::V(dreg + k)) else {
                         break;
                     };
-                    let old = match inst.read(Reg::V(dreg + k)) {
-                        Some(o) => self.i32_of(o)?,
-                        None => self.s.m.i32(0),
-                    };
+                    let old = self.old_vgpr(inst, dreg + k)?;
                     let kk = self.s.m.i32(u32::from(k));
-                    let is = self.s.m.cmp(c, pred::EQ, m0, kk);
+                    let is = self.s.m.cmp(c, pred::EQ, di, kk);
                     let x = self.s.m.select(c, is, value, old);
                     self.write_placed(inst, Reg::V(dreg + k), x, guard);
+                }
+                Ok(())
+            }
+            "v_swaprel_b32" => {
+                // v[dst + M0[25:16]] and v[src + M0[9:0]] trade values. The
+                // console writes the destination first and the source last,
+                // so a register both name keeps its value.
+                let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+                let (
+                    Some(&Operand::Vector { reg: sreg, .. }),
+                    Some(Operand::Vector { reg: dreg, .. }),
+                ) = (v.src.first(), v.dst)
+                else {
+                    return Err("an M0-relative swap");
+                };
+                let (si, di) = self.m0_halves(m0);
+                let to_dst = self.rel_read(inst, sreg, si)?;
+                let to_src = self.rel_read(inst, dreg, di)?;
+                let sbase = self.s.m.i32(u32::from(sreg));
+                let dbase = self.s.m.i32(u32::from(dreg));
+                let at_src = self.s.m.bin(c, Bin::Add, sbase, si);
+                let at_dst = self.s.m.bin(c, Bin::Add, dbase, di);
+                // Both ranges run to the program's last VGPR: their union
+                // starts at the lower base.
+                let first = sreg.min(dreg);
+                for k in 0..=255u8.saturating_sub(first) {
+                    let r = first + k;
+                    let Some(_) = inst.write(Reg::V(r)) else {
+                        break;
+                    };
+                    let old = self.old_vgpr(inst, r)?;
+                    let rr = self.s.m.i32(u32::from(r));
+                    let is_dst = self.s.m.cmp(c, pred::EQ, at_dst, rr);
+                    let x = self.s.m.select(c, is_dst, to_dst, old);
+                    let is_src = self.s.m.cmp(c, pred::EQ, at_src, rr);
+                    let x = self.s.m.select(c, is_src, to_src, x);
+                    self.write_placed(inst, Reg::V(r), x, guard);
                 }
                 Ok(())
             }
@@ -7098,6 +7167,32 @@ mod tests {
 
         for words in [add, sub] {
             lowers(&words, 0).unwrap();
+        }
+    }
+
+    #[test]
+    fn m0_relative_moves_with_two_indices_translate() {
+        // v1 = 5, v2 = 7, M0 = source offset 0, destination offset 1, then
+        // the M0-relative instruction and an LDS store of its v1 (an effect,
+        // so a value the emitter cannot produce fails the translation).
+        let program = |rel: u32| {
+            [
+                0x7E02_0285, // v_mov_b32 v1, 5
+                0x7E04_0287, // v_mov_b32 v2, 7
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xBEFC_03FF, // s_mov_b32 m0, literal
+                0x0001_0000,
+                rel,
+                0xD834_0000, // ds_write_b32 v3, v1
+                0x0000_0103,
+                S_ENDPGM,
+            ]
+        };
+        for rel in [
+            0x7E02_D101, // v_swaprel_b32 v1, v1
+            0x7E02_9101, // v_movrelsd_2_b32 v1, v1
+        ] {
+            lowers(&program(rel), 1 << 15).unwrap_or_else(|e| panic!("{rel:08x}: {e}"));
         }
     }
 

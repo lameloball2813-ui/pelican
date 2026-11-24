@@ -1313,3 +1313,41 @@ fn sdwa_16bit_dst_unused_sext_sign_extends_word0() {
         });
     }
 }
+
+#[test]
+fn m0_relative_swaps_and_moves_index_source_and_destination_apart() {
+    // v1..v4 = 10, 20, 30, 40. v_movrelsd_2_b32 and v_swaprel_b32 offset
+    // their source by M0[9:0] and their destination by M0[25:16]; other M0
+    // bits are ignored. Each case reads one VGPR back into v0.
+    const SWAPREL: u16 = 0x068;
+    const MOVRELSD_2: u16 = 0x048;
+    let cases: &[(u16, u8, u32, u8, u32)] = &[
+        // (opcode, vdst, M0, register read back, expected)
+        // v[1 + 2] <-> v[1 + 0]
+        (SWAPREL, 1, 2 << 16, 1, 30),
+        (SWAPREL, 1, 2 << 16, 3, 10),
+        // v[1 + 0] <-> v[1 + 3]
+        (SWAPREL, 1, 3, 4, 10),
+        (SWAPREL, 1, 3, 1, 40),
+        // Both name v2: it keeps its value.
+        (SWAPREL, 1, 1 << 16 | 1, 2, 20),
+        // v[5 + 1] = v[1 + 2]
+        (MOVRELSD_2, 5, 1 << 16 | 2, 6, 30),
+        // The same with every ignored M0 bit set.
+        (MOVRELSD_2, 5, 0xFC00_FC00 | 1 << 16 | 2, 6, 30),
+    ];
+    for &(op, vdst, m0, back, want) in cases {
+        let shader = build_valu_cs(&[
+            s_mov_b32(124, 0xFF), // s_mov_b32 m0, literal
+            m0,
+            vop1(op, vdst, vgpr(1)),
+            vop1(0x001, 0, vgpr(back)), // v_mov_b32 v0, v[back]
+        ]);
+        run_cases(&shader, &[[10, 20, 30, 40]], |backend, _, _, got| {
+            assert_eq!(
+                got, want,
+                "{backend}: op {op:#05x} v{vdst}, v1 with M0 {m0:#010x}, v{back} = {got}, want {want}",
+            );
+        });
+    }
+}
