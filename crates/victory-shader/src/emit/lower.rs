@@ -2292,22 +2292,21 @@ impl<'a> Lower<'a> {
                     let own = self.s.m.bin(c, Bin::And, i, m);
                     self.s.m.bin(c, Bin::Or, j, own)
                 } else {
-                    // Left by bits 5-9 lanes (bit 10: right).
-                    // shortcut: a rotation with a mask (bits 0-4) is not
-                    // lowered: the ISA's pseudocode and its examples for
-                    // mask 1 give different lanes.
-                    if mask != 0 {
-                        return Err("a masked ds_swizzle rotation");
-                    }
+                    // Left by bits 5-9 lanes (bit 10: right); the mask's
+                    // bits stay the lane's own. This is the ISA's
+                    // pseudocode, which RDNA2 hardware follows; its
+                    // examples for mask 1 list other lanes.
                     let n = offset >> 5 & 0x1F;
                     let n = if offset & 0x400 != 0 {
                         n.wrapping_neg()
                     } else {
                         n
                     };
-                    let n = k(self, n);
+                    let (n, m, rest) = (k(self, n), k(self, mask), k(self, !mask & 0x1F));
                     let j = self.s.m.bin(c, Bin::Add, i, n);
-                    self.s.m.bin(c, Bin::And, j, low)
+                    let j = self.s.m.bin(c, Bin::And, j, rest);
+                    let own = self.s.m.bin(c, Bin::And, i, m);
+                    self.s.m.bin(c, Bin::Or, j, own)
                 };
                 let group = self.s.m.bin(c, Bin::And, lane, high);
                 self.s.m.bin(c, Bin::Or, group, j)

@@ -1623,3 +1623,55 @@ fn ds_swizzle_rotate_mode() {
         }
     }
 }
+
+/// Rotations with a mask (offset[4:0]): the mask's bits of the lane index
+/// stay, the others rotate, as the ISA's pseudocode has it. Its examples for
+/// mask 1 list other lanes; the lanes here are the ones measured on RDNA2
+/// hardware (gfx1036, by Lyrnc in Marvisak/VIctory#606, who gives the first
+/// and last entries of each list and reports the pseudocode matching all 2048
+/// offsets 0xC000-0xC7FF, and bits 11 and 12 being ignored).
+#[test]
+fn ds_swizzle_masked_rotations() {
+    // The lane each lane reads.
+    let cases: [(u16, [u32; 32]); 4] = [
+        // Left by 1, mask 1: 0, 3, 2, 5, 4, 7, 6, 9, 8, ..., 28, 31, 30, 1.
+        (
+            0xC021,
+            [
+                0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14, 17, 16, 19, 18, 21, 20, 23, 22,
+                25, 24, 27, 26, 29, 28, 31, 30, 1,
+            ],
+        ),
+        // Right by 1, mask 1: 30, 1, 0, 3, 2, 5, 4, ...
+        (
+            0xC421,
+            [
+                30, 1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14, 17, 16, 19, 18, 21, 20,
+                23, 22, 25, 24, 27, 26, 29, 28, 31,
+            ],
+        ),
+        // Left by 1, mask 3: 0, 1, 2, 7, 4, 5, 6, 11, ...
+        (
+            0xC023,
+            [
+                0, 1, 2, 7, 4, 5, 6, 11, 8, 9, 10, 15, 12, 13, 14, 19, 16, 17, 18, 23, 20, 21, 22,
+                27, 24, 25, 26, 31, 28, 29, 30, 3,
+            ],
+        ),
+        // Bits 11 and 12 set: as 0xC021.
+        (
+            0xD821,
+            [
+                0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14, 17, 16, 19, 18, 21, 20, 23, 22,
+                25, 24, 27, 26, 29, 28, 31, 30, 1,
+            ],
+        ),
+    ];
+    for (offset, lanes) in cases {
+        // Lane i holds i + 1.
+        let want: Vec<u32> = lanes.iter().map(|j| j + 1).collect();
+        for got in swizzle_32(offset) {
+            assert_eq!(got, want, "offset {offset:#06x}");
+        }
+    }
+}
