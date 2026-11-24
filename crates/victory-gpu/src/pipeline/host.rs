@@ -788,7 +788,9 @@ mod tests {
 
     #[test]
     fn host_root_signature_serializes_and_creates() {
-        let Some(host) = crate::host::host() else { return };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
         let (root, bytes) = root_signature(&host.device, &[], &[], false).unwrap();
         assert!(!bytes.is_empty());
         let _ = root;
@@ -796,11 +798,6 @@ mod tests {
         assert!(!comp_bytes.is_empty());
         let _ = comp_root;
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     fn element(format: DXGI_FORMAT, offset: u32) -> D3D12_INPUT_ELEMENT_DESC {
         D3D12_INPUT_ELEMENT_DESC {
