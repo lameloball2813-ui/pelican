@@ -7739,13 +7739,7 @@ fn divergent_barriers(
 ) -> HashSet<usize> {
     let n = p.blocks.len();
     let barriers: Vec<usize> = (0..n)
-        .filter(|b| {
-            !skip.contains(b)
-                && p.blocks[*b]
-                    .insts
-                    .iter()
-                    .any(|i| i.name() == "s_barrier")
-        })
+        .filter(|b| !skip.contains(b) && p.blocks[*b].insts.iter().any(|i| i.name() == "s_barrier"))
         .collect();
     if barriers.is_empty() {
         return HashSet::new();
@@ -8124,7 +8118,7 @@ mod tests {
         let bases: Vec<usize> = l
             .iter()
             .enumerate()
-            .filter(|(i, s)| {
+            .filter(|(_, s)| {
                 s.starts_with("bin:And ")
                     && lanes.iter().any(|n| **s == format!("bin:And i{n} k32"))
             })
@@ -8200,7 +8194,7 @@ mod tests {
         }
         assert!(
             l.iter()
-                .any(|i| i.starts_with("call f") && i.contains(&format!("k117, "))),
+                .any(|i| i.starts_with("call f") && i.contains("k117, ")),
             "no waveReadLaneAt in {l:?}"
         );
         // v_readfirstlane takes the low set bit of the lane's own half of
@@ -8341,9 +8335,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -8360,9 +8352,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -8379,13 +8374,12 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }
@@ -8659,7 +8653,7 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
-    } 
+    }
     #[test]
     fn image_atomics_64_bit_lower_with_typed_int64_flag() {
         use crate::native::{RootParam, RootType};
