@@ -2191,6 +2191,28 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
+    /// The lane's own console wave's 32-lane base on a 64-lane host wave
+    /// (0 or 32): the renumbering a console lane number takes to stay a
+    /// host lane.
+    fn lane_base(&mut self) -> V {
+        let lane = self.lane_index();
+        let k32 = self.s.m.i32(32);
+        self.s.m.bin(self.cur, Bin::And, lane, k32)
+    }
+
+    /// A lane operand as a host lane: a constant one is the console's, so
+    /// on a host wave wider than the program's each half is a console wave
+    /// and console lane `k` of the lane's own wave is `k | (lane & 32)`.
+    /// On a wave64 program lanes already match one to one.
+    fn console_lane(&mut self, lane: V) -> V {
+        if matches!(lane, V::Const(_)) && !self.x.native.wave64 {
+            let base = self.lane_base();
+            self.s.m.bin(self.cur, Bin::Or, lane, base)
+        } else {
+            lane
+        }
+    }
+
     /// Code that depends on the lane layout: wave operations, and in compute
     /// the console's wave size (lanes are thread ids in group order there).
     /// Pixel lanes match only within a quad.
@@ -4775,11 +4797,13 @@ impl<'a> Lower<'a> {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                let lane = if self.mask_data == MaskData::Host {
                     self.s.flags |= flags::WAVE_OPS;
+                    self.console_lane(lane)
                 } else {
                     self.cross_lane(false)?;
-                }
+                    lane
+                };
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
@@ -4793,7 +4817,15 @@ impl<'a> Lower<'a> {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
                 };
-                self.cross_lane(false)?;
+                // The lane space is `v_readlane`'s: a host lane, or a
+                // console's constant lane of the lane's own wave.
+                let lane = if self.mask_data == MaskData::Host {
+                    self.s.flags |= flags::WAVE_OPS;
+                    self.console_lane(lane)
+                } else {
+                    self.cross_lane(false)?;
+                    lane
+                };
                 let me = self.lane_index();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
@@ -4812,14 +4844,28 @@ impl<'a> Lower<'a> {
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
-                let r = self.s.op(
-                    c,
-                    "waveReadLaneFirst.i32",
-                    Attr::NoUnwind,
-                    self.s.t.i32,
-                    118,
-                    &[a],
-                );
+                let r = if self.mask_data == MaskData::Host && !self.x.native.wave64 {
+                    // The first lane of the lane's own console wave: the low
+                    // set bit of its half of the exec ballot, renumbered to
+                    // a host lane.
+                    let exec = inst.read(Reg::S(EXEC)).ok_or(LANE_MASK)?;
+                    let d = self.mask_dword(exec)?;
+                    let f = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 32, &[d]);
+                    let base = self.lane_base();
+                    let first = self.s.m.bin(c, Bin::Or, f, base);
+                    self.read_lane(a, first)
+                } else {
+                    self.s.op(
+                        c,
+                        "waveReadLaneFirst.i32",
+                        Attr::NoUnwind,
+                        self.s.t.i32,
+                        118,
+                        &[a],
+                    )
+                };
                 int(self, r)
             }
             _ => {
@@ -8096,6 +8142,109 @@ mod tests {
                 "the wave base `i{base}` is never added in {l:?}"
             );
         }
+    }
+
+    /// On a 64-lane host wave a wave32 program's lane-indexed ops use the
+    /// lane's own console wave: a constant lane operand takes the wave's
+    /// 32-lane base, and the first lane comes from its half's ballot.
+    #[test]
+    fn a_wave32_lane_op_uses_its_own_console_wave() {
+        let words = [
+            0xD760_0004,
+            0x0001_0B02, // v_readlane_b32 v4, v2, 5
+            0xD761_0005,
+            0x0001_0A87, // v_writelane_b32 v5, 7, 5
+            0x7E0C_0502, // v_readfirstlane_b32 v6, v2
+            0x360E_0B04, // v_and_b32 v7, v4, v5
+            0x360E_0D07, // v_and_b32 v7, v7, v6
+            0x7D8A_0E80, // v_cmp_ne_u32 vcc, 0, v7
+            0xBF07_806A, // s_cmp_lg_u32 vcc_lo, 0
+            0xBF85_0001, // s_cbranch_scc1 -> the export
+            S_ENDPGM,
+            0xF800_180F,
+            0x0707_0707, // exp mrt0, v7, v7, v7, v7 done vm
+            S_ENDPGM,
+        ];
+        let lowered = lower_program(&words, HwStage::Ps, false, pixel_io()).unwrap();
+        let l = &lowered.insts;
+        let lane_calls: Vec<usize> = l
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.starts_with("call f") && i.ends_with("[k111]"))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!lane_calls.is_empty(), "no lane index in {l:?}");
+        let bases: Vec<usize> = lane_calls
+            .iter()
+            .flat_map(|n| {
+                l.iter()
+                    .enumerate()
+                    .filter(|(_, i)| **i == format!("bin:And i{n} k32"))
+                    .map(|(i, _)| i)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let used = |v: usize| -> bool {
+            l.iter()
+                .any(|i| i.ends_with(&format!("i{v}]")) || i.ends_with(&format!(" i{v}")))
+        };
+        // Console lane 5 of the lane's own wave is host lane 5 | (lane & 32),
+        // for both v_readlane (readLaneAt) and v_writelane (lane equality).
+        let ors: Vec<usize> = bases
+            .iter()
+            .filter_map(|b| l.iter().position(|i| i == &format!("bin:Or k5 i{b}")))
+            .collect();
+        assert_eq!(ors, Vec::from([2, 6]), "no `5 | base` host lanes in {l:?}");
+        for or in &ors {
+            assert!(used(*or), "the host lane `i{or}` is never used in {l:?}");
+        }
+        assert!(
+            l.iter()
+                .any(|i| i.starts_with("call f") && i.contains(&format!("k117, "))),
+            "no waveReadLaneAt in {l:?}"
+        );
+        // v_readfirstlane takes the low set bit of the lane's own half of
+        // the exec ballot, renumbered to a host lane.
+        let ballot = l
+            .iter()
+            .position(|i| i.starts_with("call f") && i.contains("[k116, "))
+            .expect("no exec ballot");
+        let (x, y) = (
+            at(l, &format!("extract i{ballot} 0")),
+            at(l, &format!("extract i{ballot} 1")),
+        );
+        let own = l
+            .iter()
+            .position(|i| i.starts_with("select ") && i.ends_with(&format!("i{y} i{x}")))
+            .expect("no own-half pick");
+        let first = l
+            .iter()
+            .position(|i| i.starts_with("call f") && i.contains(&format!("k32, i{own}")))
+            .expect("no first bit of the own half");
+        let host_first = bases
+            .iter()
+            .find_map(|b| l.iter().position(|i| i == &format!("bin:Or i{first} i{b}")))
+            .expect("the first lane is not renumbered");
+        assert!(used(host_first), "no read at the first host lane in {l:?}");
+
+        // On a wave64 program console lanes are host lanes one to one: the
+        // same reads need no renumbering at all.
+        let l64 = lower_program(&words, HwStage::Ps, true, pixel_io()).unwrap();
+        let l = &l64.insts;
+        assert!(
+            !l.iter().any(|i| i.starts_with("bin:Or ")),
+            "a wave64 lane operand is renumbered in {l:?}"
+        );
+        assert!(
+            l.iter()
+                .any(|i| i.starts_with("call f") && i.contains("k117, ") && i.contains("k5]")),
+            "no direct waveReadLaneAt of lane 5 in {l:?}"
+        );
+        assert!(
+            l.iter()
+                .any(|i| i.starts_with("call f") && i.contains("k118, ")),
+            "a wave64 first lane is not waveReadLaneFirst in {l:?}"
+        );
     }
 
     /// The ballot-half pick is for wave32 graphics programs only: a wave64
