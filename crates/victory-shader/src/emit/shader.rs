@@ -280,6 +280,10 @@ impl Shader {
 
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
     /// the index may differ between lanes (`NonUniformResourceIndex`).
+    /// Out-of-bounds indices (e.g. garbage/negative values from dropped
+    /// passes) are clamped to slot 0 so `ResourceDescriptorHeap` /
+    /// `SamplerDescriptorHeap` reads cannot page-fault the host GPU past the
+    /// heap's end.
     pub fn heap_handle(
         &mut self,
         block: usize,
@@ -294,6 +298,10 @@ impl Shader {
             flags::RESOURCE_HEAP
         };
         self.nonuniform_handles += u32::from(nonuniform);
+        let limit = self.m.i32(if sampler { 2048 } else { 1_000_000 });
+        let zero = self.m.i32(0);
+        let in_bounds = self.m.cmp(block, super::bitcode::pred::IULT, index, limit);
+        let index = self.m.select(block, in_bounds, index, zero);
         let (s, n) = (self.m.bool(sampler), self.m.bool(nonuniform));
         let h = self.op(
             block,
