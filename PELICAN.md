@@ -38,6 +38,11 @@ reading them and running the tests on an RTX 5060 Ti and WARP.
 | #793 | asset policy folds trailing `..` and `\\?\` paths | geiyiliyabumo |
 | #790 | the space below 4 GiB is kept for the title's 32-bit memory | NuraadGit |
 
+Open VIctory pull requests merged here as well (their authors' commits):
+#588, #590, #592, #601, #613, #616, #618, #629, #633, #640, #648, #652, #658,
+#659, #661, #662, #664, #665, #670, #679, #682, #689. Not merged yet, as they
+conflict with the fixes above or no longer build: #584, #635, #655, #673, #683.
+
 Pelican's own fixes for VIctory issues: #811 (OLEAUT32 BSTR functions) and
 hardware tests for #800, #802, #803.
 
