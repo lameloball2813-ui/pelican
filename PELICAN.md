@@ -11,6 +11,24 @@ lists where the two differ. Everything not listed here is VIctory's, unchanged.
 | Default data and cache folder | `%LOCALAPPDATA%\pelican` | `%LOCALAPPDATA%\victory` |
 | Input | Keyboard reports the character each held key types (layout, Shift, Caps Lock, AltGr, dead keys) | Character fields left empty |
 
+## Fixes waiting on VIctory, merged here
+
+VIctory accepts pull requests from collaborators only, so fixes offered on
+its issues wait on contributors' forks. Pelican takes them in as their
+authors' own commits (each says `cherry picked from commit ...`), after
+reading them and running the tests on an RTX 5060 Ti and WARP.
+
+| VIctory issue | Fix | Author |
+|---|---|---|
+| #761 | architecture.md lists BCPack as implemented | geiyiliyabumo |
+| #792 | `VICTORY_CAPTURE` makes its folder if missing | JFIREonFIRE |
+| #727 | display deferral works where Windows refuses the power request | geiyiliyabumo |
+| #831 | `pelican config` fails when a path breaks the asset policy | kyle7908 |
+| #718 | format support and multisample queries answered by the host GPU | fuzeofficlal |
+
+Pelican's own fixes for VIctory issues: #811 (OLEAUT32 BSTR functions) and
+hardware tests for #800, #802, #803.
+
 Kept on purpose, so upstream changes merge without conflicts:
 
 - package and crate names (`victory`, `victory-*`), so build with
