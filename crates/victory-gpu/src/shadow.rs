@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -43,6 +43,8 @@ pub(crate) struct Shadow {
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// Current D3D12 resource state of this buffer copy.
+    state: AtomicU32,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -118,6 +120,23 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             before: Mutex::default(),
+            state: AtomicU32::new(0), // D3D12_RESOURCE_STATE_COMMON
+        }
+    }
+
+    /// Transitions `buffer` to `wanted` state on `list` if needed (e.g. from
+    /// UNORDERED_ACCESS to VERTEX_AND_CONSTANT_BUFFER).
+    pub(crate) fn ensure_state(&self, list: &HostList, wanted: u32) {
+        let before = self.state.swap(wanted, Ordering::Relaxed);
+        if before != wanted && before != 0 {
+            use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES;
+            let barrier = crate::host::transition(
+                &self.buffer,
+                D3D12_RESOURCE_STATES(before as i32),
+                D3D12_RESOURCE_STATES(wanted as i32),
+            );
+            // SAFETY: an open list and a live shadow buffer.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
         }
     }
 
@@ -155,7 +174,8 @@ impl Shadow {
             .push((address, address + len));
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let host =
+            |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (start, end) = match &*before {
             Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
@@ -496,4 +516,36 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shadow_buffer_transitions_state_when_requested() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(shadow) = loose(0x10000000, 0x10001000) else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        // Initial state is COMMON (0)
+        assert_eq!(shadow.state.load(Ordering::Relaxed), 0);
+
+        // Transition to UNORDERED_ACCESS (0x8)
+        shadow.ensure_state(&list, 0x8);
+        assert_eq!(shadow.state.load(Ordering::Relaxed), 0x8);
+
+        // Transition from UNORDERED_ACCESS to VERTEX_AND_CONSTANT_BUFFER (0x1) emits barrier
+        shadow.ensure_state(&list, 0x1);
+        assert_eq!(shadow.state.load(Ordering::Relaxed), 0x1);
+
+        // Same state does nothing
+        shadow.ensure_state(&list, 0x1);
+        assert_eq!(shadow.state.load(Ordering::Relaxed), 0x1);
+    }
 }
