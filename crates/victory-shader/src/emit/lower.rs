@@ -6234,6 +6234,11 @@ impl<'a> Lower<'a> {
                 }
             };
             let h = self.handle(site, src, false, (kind | 0x1000, comp))?;
+            // Typed image atomics use ResourceDescriptorHeap handles; DXIL
+            // requires the separate heap-resource int64 atomic feature bit.
+            if wide {
+                self.s.flags |= flags::ATOMIC_INT64_ON_DESCRIPTOR_HEAP_RESOURCE;
+            }
             let at = self.begin_guarded(guard);
             let mut args = vec![h];
             let r = if cmpswap {
