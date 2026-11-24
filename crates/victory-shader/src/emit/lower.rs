@@ -47,6 +47,9 @@ pub(crate) struct Lowered {
     /// The names of the emitted functions (which dx.ops ran); tests only.
     #[cfg(test)]
     pub op_names: Vec<String>,
+    /// The emitted instructions, one line each; tests only.
+    #[cfg(test)]
+    pub insts: Vec<String>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1039,6 +1042,8 @@ impl<'a> Lower<'a> {
         let cmp_samplers = self.s.cmp_samplers;
         #[cfg(test)]
         let op_names = self.s.m.func_names().map(str::to_owned).collect();
+        #[cfg(test)]
+        let insts = self.s.m.inst_lines();
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -1052,6 +1057,8 @@ impl<'a> Lower<'a> {
             samplers: self.samplers,
             #[cfg(test)]
             op_names,
+            #[cfg(test)]
+            insts,
         })
     }
 
@@ -7833,6 +7840,41 @@ mod tests {
         assert!(packed_input_half(&sig, 6, None, 4, false).is_err());
     }
 
+    /// Lowers `words` as a `stage` program (`wave64`: the console's wave
+    /// size) with no resources or inputs.
+    fn lower_program(
+        words: &[u32],
+        stage: HwStage,
+        wave64: bool,
+        io: StageIo,
+    ) -> Result<Lowered, crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage,
+            wave64,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io,
+            code,
+        };
+        let p = ir::build(&native.code, wave64, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+    }
+
     /// Whether a synthetic compute program translates with these input registers.
     fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -7962,9 +8004,71 @@ mod tests {
 
     /// A wave32 graphics program's host wave may have 64 lanes, whose upper
     /// half is a second console wave: a lane mask read as a number picks the
-    /// reader's half of the ballot, so the reader's lane index is needed.
+    /// reader's half of the ballot.
     #[test]
     fn a_wave32_mask_read_takes_its_ballot_half() {
+        let words = [
+            0x7D8A_0480, // v_cmp_ne_u32 vcc, 0, v2
+            0xBE84_0F6A, // s_bcnt1_i32_b32 s4, vcc_lo
+            0xBF07_806A, // s_cmp_lg_u32 vcc_lo, 0
+            0x7E08_0204, // v_mov_b32 v4, s4
+            0xD765_0005,
+            0x0001_006A, // v_mbcnt_lo_u32_b32 v5, vcc_lo, 0
+            0xD766_0006,
+            0x0002_0A6A, // v_mbcnt_hi_u32_b32 v6, vcc_lo, v5
+            0xBF85_0001, // s_cbranch_scc1 -> the export
+            S_ENDPGM,    // no lane had its bit: done
+            0xF800_180F,
+            0x0406_0504, // exp mrt0, v4, v5, v6, v4 done vm
+            S_ENDPGM,
+        ];
+        let lowered = lower_program(&words, HwStage::Ps, false, pixel_io()).unwrap();
+        let f = |name| lowered.op_names.iter().position(|n| n == name);
+        let (lane, ballot, bits) = (
+            f("dx.op.waveGetLaneIndex").expect("no lane index for the pick"),
+            f("dx.op.waveActiveBallot").expect("no ballot for the mask read"),
+            f("dx.op.unaryBits.i32").expect("no bit count"),
+        );
+        let l = &lowered.insts;
+        let lanes: Vec<usize> = l
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| **i == format!("call f{lane} [k111]"))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!lanes.is_empty(), "no lane index for the pick");
+        let i_ballot = l
+            .iter()
+            .position(|i| i.starts_with(&format!("call f{ballot} [k116, ")))
+            .expect("no ballot");
+        let (i_x, i_y) = (
+            at(l, &format!("extract i{i_ballot} 0")),
+            at(l, &format!("extract i{i_ballot} 1")),
+        );
+        // The pick: upper host lanes read the ballot's second dword.
+        let i_cmp = l
+            .iter()
+            .position(|i| {
+                i.starts_with("cmp:") && lanes.iter().any(|n| i.ends_with(&format!("i{n} k32")))
+            })
+            .expect("no `lane >= 32` compare");
+        at(l, &format!("select i{i_cmp} i{i_y} i{i_x}"));
+        // v_mbcnt_lo counts below the lane in its own half; a wave32 mask's
+        // high half is empty, so v_mbcnt_hi's count is of no bits.
+        assert!(
+            lanes
+                .iter()
+                .any(|n| l.contains(&format!("bin:And i{n} k31"))),
+            "no `lane & 31` in {l:?}"
+        );
+        at(l, &format!("call f{bits} [k31, k0]"));
+    }
+
+    /// The ballot-half pick is for wave32 graphics programs only: a wave64
+    /// program's mask dwords are its own, and the console path (compute) is
+    /// the whole host wave already, so neither reads the lane index for it.
+    #[test]
+    fn only_host_wave32_reads_take_a_ballot_half() {
         let words = [
             0x7D8A_0480, // v_cmp_ne_u32 vcc, 0, v2
             0xBE84_0F6A, // s_bcnt1_i32_b32 s4, vcc_lo
@@ -7973,45 +8077,42 @@ mod tests {
             0x0404_0404, // exp mrt0, v4, v4, v4, v4 done vm
             S_ENDPGM,
         ];
-        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-        let native = NativeProgram {
-            stage: HwStage::Ps,
-            wave64: false,
-            vgprs: 256,
-            layout: vec![],
-            used: vec![],
-            io: StageIo::Ps {
-                inputs: vec![],
-                input_addr: 0,
-                db_shader_control: 0,
-                patches: vec![],
-            },
-            code,
-        };
-        let p = ir::build(&native.code, false, 256).unwrap();
-        let st = structure::structure(&p).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-        let io = io::raise(&p, &native).unwrap();
-        let lowered = lower(&Parts {
-            native: &native,
-            p: &p,
-            st: &st,
-            io: &io,
-            res: &res,
+        let l64 = lower_program(&words, HwStage::Ps, true, pixel_io()).unwrap();
+        assert!(!l64.op_names.iter().any(|n| n == "dx.op.waveGetLaneIndex"));
+        let words = [
+            0x7D8A_0480, // v_cmp_ne_u32 vcc, 0, v0
+            0xBE84_0F6A, // s_bcnt1_i32_b32 s4, vcc_lo
+            0xBF07_8004, // s_cmp_lg_u32 s4, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE85_0380, // s_mov_b32 s5, 0
+            S_ENDPGM,
+        ];
+        let cs = lower_program(&words, HwStage::Cs, false, compute_io()).unwrap();
+        assert!(!cs.op_names.iter().any(|n| n == "dx.op.waveGetLaneIndex"));
+    }
+
+    fn pixel_io() -> StageIo {
+        StageIo::Ps {
             inputs: vec![],
-            outputs: vec![],
-            prims: vec![],
-            mesh_stride: 0,
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: vec![],
+        }
+    }
+
+    fn compute_io() -> StageIo {
+        StageIo::Cs(ComputeIo {
+            rsrc2: 0,
+            threads: [1, 1, 1],
         })
-        .unwrap();
-        // Without the per-half pick, nothing reads the lane index here.
-        assert!(
-            lowered
-                .op_names
-                .iter()
-                .any(|n| n == "dx.op.waveGetLaneIndex"),
-            "the mask read should pick the lane's half of the ballot"
-        );
+    }
+
+    /// The index of the instruction `pat` names in `lines`.
+    fn at(lines: &[String], pat: &str) -> usize {
+        lines
+            .iter()
+            .position(|l| l == pat)
+            .unwrap_or_else(|| panic!("no `{pat}` in {lines:?}"))
     }
 
     #[test]
