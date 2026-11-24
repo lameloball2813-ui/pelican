@@ -71,6 +71,10 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
+`victory config` prints the resolved configuration and any asset-policy
+diagnostics. It exits with a nonzero status if any configured path fails
+the asset-policy check.
+
 Run the title:
 
 ```powershell

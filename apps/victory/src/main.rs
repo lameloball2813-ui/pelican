@@ -185,6 +185,7 @@ fn show_config() -> Result<()> {
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
+    let mut policy_failed = false;
     for p in cfg
         .game_dir
         .iter()
@@ -193,8 +194,13 @@ fn show_config() -> Result<()> {
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");
+            policy_failed = true;
         }
     }
+    anyhow::ensure!(
+        !policy_failed,
+        "configuration failed the asset policy check"
+    );
     Ok(())
 }
 
