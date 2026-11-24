@@ -12,8 +12,17 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 pub(crate) fn folder() -> Option<&'static PathBuf> {
     static FOLDER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     FOLDER
-        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(PathBuf::from))
+        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE").map(|f| made(PathBuf::from(f))))
         .as_ref()
+}
+
+/// `folder`, created if missing (every frame failed to save into a folder
+/// that did not exist yet).
+fn made(folder: PathBuf) -> PathBuf {
+    if let Err(e) = std::fs::create_dir_all(&folder) {
+        tracing::warn!(error = %e, path = %folder.display(), "capture folder not made");
+    }
+    folder
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
@@ -520,6 +529,17 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    /// A capture folder that does not exist yet is made, with its parents.
+    #[test]
+    fn a_missing_capture_folder_is_made() {
+        let root = std::env::temp_dir().join(format!("victory-capture-{}", std::process::id()));
+        let folder = root.join("new").join("frames");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(super::made(folder.clone()), folder);
+        assert!(folder.is_dir());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
