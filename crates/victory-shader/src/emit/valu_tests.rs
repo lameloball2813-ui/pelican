@@ -1457,3 +1457,26 @@ fn v_cvt_flr_i32_f32_rounds_down() {
         ],
     );
 }
+
+#[test]
+fn v_cvt_flr_and_rpi_i32_f32_saturate_nan_by_sign() {
+    // Unlike v_cvt_i32_f32 (NaN gives 0), these saturate whatever has an
+    // exponent above 30, a NaN too: to the largest or the smallest integer
+    // by its sign.
+    let cases = [
+        (0x7FC0_0000, 0x7FFF_FFFF),
+        (0x7F80_0001, 0x7FFF_FFFF),
+        (0x7FFF_FFFF, 0x7FFF_FFFF),
+        (0xFFC0_0000, 0x8000_0000),
+        (0xFF80_0001, 0x8000_0000),
+        (0xFFFF_FFFF, 0x8000_0000),
+    ];
+    check_cvt("v_cvt_rpi_i32_f32", 0x00C, &cases);
+    check_cvt("v_cvt_flr_i32_f32", 0x00D, &cases);
+    // v_cvt_i32_f32 keeps giving 0.
+    check_cvt(
+        "v_cvt_i32_f32",
+        0x008,
+        &[(0x7FC0_0000, 0), (0xFFC0_0000, 0), (0x7F80_0001, 0)],
+    );
+}

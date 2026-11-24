@@ -4135,13 +4135,28 @@ impl<'a> Lower<'a> {
                     }
                 }
                 // D3D's conversions saturate and give 0 for NaN, as the
-                // hardware does (checked on the RX 6700 XT and WARP).
+                // hardware's two plain ones do (checked on the RX 6700 XT
+                // and WARP).
                 let op = if name == "v_cvt_u32_f32" {
                     Cast::FpToUi
                 } else {
                     Cast::FpToSi
                 };
-                let r = self.s.m.cast(c, op, a, self.s.t.i32);
+                let mut r = self.s.m.cast(c, op, a, self.s.t.i32);
+                if name == "v_cvt_flr_i32_f32" || name == "v_cvt_rpi_i32_f32" {
+                    // These two saturate a NaN too, by its sign (its
+                    // exponent is above 30, as that of any other magnitude
+                    // too great).
+                    let bits = self.as_int(x);
+                    let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+                    let (abs, inf, zero) = (k(self, 0x7FFF_FFFF), k(self, 0x7F80_0000), k(self, 0));
+                    let (max, min) = (k(self, 0x7FFF_FFFF), k(self, 0x8000_0000));
+                    let mag = self.s.m.bin(c, Bin::And, bits, abs);
+                    let nan = self.s.m.cmp(c, pred::IUGT, mag, inf);
+                    let neg = self.s.m.cmp(c, pred::SLT, bits, zero);
+                    let sat = self.s.m.select(c, neg, min, max);
+                    r = self.s.m.select(c, nan, sat, r);
+                }
                 int(self, r)
             }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
