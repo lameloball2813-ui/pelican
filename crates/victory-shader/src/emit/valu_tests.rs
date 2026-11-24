@@ -1788,7 +1788,13 @@ fn v_cvt_pknorm_f16_rounds_the_exact_product() {
         0x8001, 0x0400, // smallest normal
         0x3BFF, // just below 1
         0x1001, 0x2E66, 0xB266, 0x3A00, 0x3401,
+        // Large denormals, which scale to 1 or 2: kept, not flushed (the
+        // FP16 input-denormal mode RDNA2 measurements matched).
+        0x03D6, 0x83D6, 0x823F, 0x03FF,
     ];
+    // Measured on RDNA2 (gfx1036) with FP16 input denormals kept.
+    assert_eq!(norm16_ref(f16_to_f32(0x83D6), true), 0xFFFE);
+    assert_eq!(norm16_ref(f16_to_f32(0x823F), true), 0xFFFF);
     for (op, signed, what) in [
         (0x312u16, true, "v_cvt_pknorm_i16_f16"),
         (0x313, false, "v_cvt_pknorm_u16_f16"),
