@@ -308,6 +308,77 @@ impl HostHeap {
         self.keep(index, None);
     }
 
+    /// Makes slot `index` a null descriptor matching the resource kind and
+    /// buffer/texture class (`dwords == 4` -> buffer, `8` -> texture) that
+    /// the translated shader declares for that slot. Avoids GPU device
+    /// removal on NVIDIA when an unwritten slot is read as a UAV, CBV, or
+    /// buffer SRV instead of a 2D texture SRV.
+    pub(crate) fn make_null_for_used(
+        &self,
+        index: u32,
+        used: Option<&victory_shader::UsedResource>,
+    ) {
+        use victory_shader::ResourceType;
+        if self.sampler {
+            self.make_null(index);
+            return;
+        }
+        let Some(u) = used else {
+            self.make_null(index);
+            return;
+        };
+        let is_buffer = u.dwords == 4;
+        // Sentinel keys have generation == 0 (real view keys start at generation 1).
+        let sentinel: u64 = match (u.kind, is_buffer) {
+            (ResourceType::Cbv, _) => 1,
+            (ResourceType::Srv, true) => 2,
+            (ResourceType::Srv, false) => 3,
+            (ResourceType::Uav, true) => 4,
+            (ResourceType::Uav, false) => 5,
+            (ResourceType::Sampler | ResourceType::Other(_), _) => return,
+        };
+        if (index as usize) < self.count as usize {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            if made[index as usize] == sentinel {
+                return;
+            }
+            made[index as usize] = sentinel;
+        }
+        self.keep(index, None);
+        let at = self.cpu(index);
+        let Some(host) = host() else { return };
+        match (u.kind, is_buffer) {
+            (ResourceType::Cbv, _) => {
+                let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+                // SAFETY: a slot of our heap; zero location makes a null CBV.
+                unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            }
+            (ResourceType::Srv, true) => null_buffer_view(at),
+            (ResourceType::Srv, false) => null_view(at),
+            (ResourceType::Uav, true) | (ResourceType::Uav, false) => {
+                let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_UINT,
+                    ViewDimension: if is_buffer {
+                        D3D12_UAV_DIMENSION_BUFFER
+                    } else {
+                        D3D12_UAV_DIMENSION_TEXTURE2D
+                    },
+                    ..Default::default()
+                };
+                // SAFETY: a slot of our heap; null resource is valid with a desc.
+                unsafe {
+                    host.device.CreateUnorderedAccessView(
+                        None::<&ID3D12Resource>,
+                        None::<&ID3D12Resource>,
+                        Some(&desc),
+                        at,
+                    );
+                }
+            }
+            (ResourceType::Sampler | ResourceType::Other(_), _) => {}
+        }
+    }
+
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());

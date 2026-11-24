@@ -645,6 +645,8 @@ impl State {
         };
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u, &view);
+        } else {
+            host.make_null_for_used(index, Some(u));
         }
     }
 
@@ -770,7 +772,7 @@ impl State {
                         }
                     }
                     None => {
-                        host.make_null(index);
+                        host.make_null_for_used(index, used.copied());
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
