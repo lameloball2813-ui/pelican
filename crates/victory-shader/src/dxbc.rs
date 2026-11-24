@@ -80,9 +80,16 @@ impl<'a> Container<'a> {
         if count > MAX_PARTS {
             return Err(ShaderError::Malformed("implausible part count"));
         }
+        let table = HEADER_SIZE + 4 * count;
+        if table > total {
+            return Err(ShaderError::Malformed("part table exceeds container"));
+        }
         let mut parts = Vec::with_capacity(count);
         for i in 0..count {
             let offset = u32_at(data, HEADER_SIZE + 4 * i)? as usize;
+            if offset < table {
+                return Err(ShaderError::Malformed("part offset inside header or table"));
+            }
             let fourcc = FourCC(
                 data.get(offset..offset + 4)
                     .ok_or(ShaderError::Malformed("part header out of bounds"))?
@@ -177,5 +184,22 @@ mod tests {
         assert!(Container::parse(&bytes).is_err());
         bytes.truncate(last);
         assert!(Container::parse(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_part_offset_inside_header_or_table() {
+        let mut bytes = build(&[(FourCC::SFI0, &[0; 8])]);
+        // Point the part offset back to 0 (container header magic "DXBC")
+        bytes[0x20..0x24].copy_from_slice(&0u32.to_le_bytes());
+        assert!(Container::parse(&bytes).is_err());
+
+        // Point the part offset inside the table itself (e.g. 0x20)
+        bytes[0x20..0x24].copy_from_slice(&0x20u32.to_le_bytes());
+        assert!(Container::parse(&bytes).is_err());
+
+        // Part count where the table extends past the container total size
+        let mut overflow_table = build(&[(FourCC::SFI0, &[0; 8])]);
+        overflow_table[0x1C..0x20].copy_from_slice(&200u32.to_le_bytes());
+        assert!(Container::parse(&overflow_table).is_err());
     }
 }
