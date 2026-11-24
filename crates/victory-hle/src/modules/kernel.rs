@@ -17,7 +17,7 @@ pub extern "system" fn GetModuleHandleW(name: *const u16) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&wide(name), false).unwrap_or_else(|| host::get_module_handle_w(name))
+    find_module(&wide(name), false, true).unwrap_or_else(|| host::get_module_handle_w(name))
 }
 
 /// See [`GetModuleHandleW`].
@@ -25,7 +25,7 @@ pub extern "system" fn GetModuleHandleA(name: *const u8) -> *mut c_void {
     if name.is_null() {
         return runtime::main_image().unwrap_or(0) as *mut c_void;
     }
-    find_module(&narrow(name), false).unwrap_or_else(|| host::get_module_handle_a(name))
+    find_module(&narrow(name), false, true).unwrap_or_else(|| host::get_module_handle_a(name))
 }
 
 /// A NUL-terminated string from the title.
@@ -106,8 +106,9 @@ pub extern "system" fn LoadLibraryExA(
     file: *mut c_void,
     flags: u32,
 ) -> *mut c_void {
+    let runs = runs_code(flags);
     if !name.is_null()
-        && let Some(handle) = find_module(&narrow(name), runs_code(flags))
+        && let Some(handle) = find_module(&narrow(name), runs, runs)
     {
         return handle;
     }
@@ -120,8 +121,9 @@ pub extern "system" fn LoadLibraryExW(
     file: *mut c_void,
     flags: u32,
 ) -> *mut c_void {
+    let runs = runs_code(flags);
     if !name.is_null()
-        && let Some(handle) = find_module(&wide(name), runs_code(flags))
+        && let Some(handle) = find_module(&wide(name), runs, runs)
     {
         return handle;
     }
@@ -293,8 +295,9 @@ fn handle(m: &HleModule) -> *mut c_void {
 /// The title's images and our console modules by name; `None` leaves the
 /// name to the host, which only DLLs `HostPolicy` passes through get (as at
 /// import binding); others fail. With `load`, a title DLL not mapped yet is
-/// mapped now.
-fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
+/// mapped now. Without `runs`, the load runs no code (a data-file load), so
+/// even a DLL outside `HostPolicy` goes to the host's loader.
+fn find_module(path: &str, load: bool, runs: bool) -> Option<*mut c_void> {
     let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
     // As the Windows loader does, a name without extension means a DLL.
     let file = if file.contains('.') {
@@ -327,7 +330,7 @@ fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
         }
         return Some(handle(m));
     }
-    if host_dll {
+    if host_dll || !runs {
         return None;
     }
     // Any other host DLL (wininet, urlmon, ...) is beyond what we guard, and
@@ -683,5 +686,17 @@ mod tests {
         let runtime = LoadLibraryA(c"xgameruntime.dll".as_ptr().cast());
         assert!(!runtime.is_null());
         assert_eq!(GetModuleHandleW(w("XGameRuntime.dll").as_ptr()), runtime);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_data_load_of_a_host_dll_reaches_the_host() {
+        // comctl32.dll is outside HostPolicy. A data-file load runs no code,
+        // so the host's loader maps it even though we would refuse to run it.
+        let data = LoadLibraryExW(w("comctl32.dll").as_ptr(), std::ptr::null_mut(), 0x2);
+        // SAFETY: reads this thread's last error.
+        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        assert!(!data.is_null(), "last error {error}");
+        assert_eq!(FreeLibrary(data), 1);
     }
 }
