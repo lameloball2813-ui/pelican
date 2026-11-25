@@ -1496,8 +1496,26 @@ impl HostList {
     /// A buffer's first use is handled by the prelude. Subsequent uses
     /// transition from the state recorded in this list, not another thread's.
     pub(crate) fn ensure_buffer_state(&self, resource: &ID3D12Resource, wanted: u32) {
-        let wanted = buffer_state(wanted);
         let mut states = self.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
+        self.ensure_buffer_state_locked(&mut states, resource, wanted);
+    }
+
+    /// Register a certified SRV read segment under one state-map lock.
+    /// Preserve every first-use and transition in original shadow order;
+    /// callers must not batch across a heap PlanStep::Write.
+    pub(crate) fn ensure_shadow_read_states(
+        &self,
+        ranges: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(u64, u64)>)],
+    ) {
+        let mut states = self.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
+        for (shadow, _) in ranges {
+            self.ensure_buffer_state_locked(&mut states, &shadow.buffer, 0x40 | 0x80);
+        }
+    }
+
+    /// Both scalar and run-based registration use one exact state machine.
+    fn ensure_buffer_state_locked(&self, states: &mut BufferStates, resource: &ID3D12Resource, wanted: u32) {
+        let wanted = buffer_state(wanted);
         let key = resource.as_raw() as usize;
         match states.entry(key) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -3124,6 +3142,62 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         }
         super::record_refresh_run(&mut bulk, &read_runs[0]);
         assert_eq!(snapshot(&scalar), snapshot(&bulk));
+    }
+
+    #[test]
+    fn shadow_read_state_run_matches_scalar_with_uav_boundaries() {
+        use windows::core::Interface;
+        let Some(host) = super::host() else { return };
+        let base = 0x1d1200000u64;
+        crate::shadow::register(0x72101, base, 4096);
+        struct Unregister(u64);
+        impl Drop for Unregister {
+            fn drop(&mut self) {
+                crate::shadow::unregister(0x72101, self.0);
+                crate::shadow::unregister(0x72102, self.0);
+            }
+        }
+        let _unregister = Unregister(base);
+        let a = crate::shadow::find(base, 4096).expect("first shadow");
+        crate::shadow::unregister(0x72101, base);
+        crate::shadow::register(0x72102, base, 4096);
+        let b = crate::shadow::find(base, 4096).expect("independent reused title VA");
+        assert!(!Arc::ptr_eq(&a, &b));
+
+        let first = vec![
+            (a.clone(), vec![(base, base + 1024)]),
+            (b.clone(), vec![(base + 1024, base + 2048)]),
+            (a.clone(), vec![(base + 2048, base + 3072)]),
+        ];
+        let after_write = vec![
+            (b.clone(), vec![(base + 42, base + 52)]),
+            (a.clone(), vec![(base + 128, base + 256)]),
+        ];
+        let scalar = host.new_list().expect("scalar list");
+        let bulk = host.new_list().expect("bulk list");
+        let states = |list: &super::HostList| {
+            let map = list.buffer_states.lock().unwrap_or_else(|e| e.into_inner());
+            let mut values = map.iter().map(|(&key, &(first, last, ref resource))|
+                (key, first, last, resource.as_raw() as usize)).collect::<Vec<_>>();
+            values.sort_unstable();
+            values
+        };
+        for (shadow, _) in &first { shadow.ensure_state(&scalar, 0x40 | 0x80); }
+        bulk.ensure_shadow_read_states(&first);
+        assert_eq!(states(&scalar), states(&bulk));
+        assert_eq!(states(&scalar).len(), 2, "original title VA must not merge distinct buffers");
+
+        for list in [&scalar, &bulk] { a.ensure_state(list, 0x8); }
+        assert_eq!(states(&scalar), states(&bulk));
+        for (shadow, _) in &after_write { shadow.ensure_state(&scalar, 0x40 | 0x80); }
+        bulk.ensure_shadow_read_states(&after_write);
+        assert_eq!(states(&scalar), states(&bulk));
+        let snapshot = states(&bulk);
+        assert!(snapshot.iter().all(|&(_, first, last, _)|
+            first == super::buffer_state(0x40 | 0x80) && last == first));
+        // A fresh list must not inherit recording-time buffer states.
+        let fresh = host.new_list().expect("fresh list");
+        assert!(states(&fresh).is_empty());
     }
 
     #[test]

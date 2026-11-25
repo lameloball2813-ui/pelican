@@ -628,16 +628,29 @@ impl State {
         // Unknown GPU-dependent indices still admit every original slot of
         // their class. Cache exact provenance, including mixed classes and
         // any named slots outside the fallback, not the actual GPU index.
-        if fallback != 0
-            && let Some((plan, _checked)) = host.buffer_batch(heap.start, fallback, exact.clone())
-        {
+        #[cfg(feature = "diagnostics")]
+        let batch_started = std::time::Instant::now();
+        let batch = (fallback != 0).then(|| host.buffer_batch(heap.start, fallback, exact.clone())).flatten();
+        #[cfg(feature = "diagnostics")]
+        let batch_us = batch_started.elapsed().as_micros() as u64;
+        if let Some((plan, _checked)) = batch {
             // The exact shadow bindings survive descriptor updates; retain
             // the range union and state for this list, not a prior list.
+            #[cfg(feature = "diagnostics")]
+            let state_us = std::cell::Cell::new(0u64);
+            #[cfg(feature = "diagnostics")]
+            let enqueue_us = std::cell::Cell::new(0u64);
             let replay_reads = |ranges: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(u64, u64)>)]| {
-                for (shadow, _) in ranges {
-                    shadow.ensure_state(list, 0x40 | 0x80);
-                }
+                #[cfg(feature = "diagnostics")]
+                let phase = std::time::Instant::now();
+                list.ensure_shadow_read_states(ranges);
+                #[cfg(feature = "diagnostics")]
+                state_us.set(state_us.get() + phase.elapsed().as_micros() as u64);
+                #[cfg(feature = "diagnostics")]
+                let phase = std::time::Instant::now();
                 list.defer_refresh_run(ranges);
+                #[cfg(feature = "diagnostics")]
+                enqueue_us.set(enqueue_us.get() + phase.elapsed().as_micros() as u64);
             };
             replay_reads(&plan.ranges);
             for step in &plan.ordered {
@@ -651,7 +664,9 @@ impl State {
                 }
             }
             #[cfg(feature = "diagnostics")]
-            crate::copystat::heap_scan(_hash, _checked, plan.prepared, started.elapsed().as_micros() as u64);
+            crate::copystat::heap_scan_phases(_hash, _checked, plan.prepared,
+                started.elapsed().as_micros() as u64,
+                Some((batch_us, state_us.get(), enqueue_us.get())));
             return Some(gpu);
         }
         // Preserve the old full class scan for anything not proven by the

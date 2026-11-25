@@ -87,19 +87,46 @@ type Ranges = HashMap<(usize, usize), (u64, u64, u64, u64)>;
 static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
 
 /// Per shader, time and slots visited in conservative bindless buffer scans.
-/// This separates command-recording work from submission refresh/copy costs.
-static HEAP_SCANS: Mutex<Option<HashMap<String, (u64, u64, u64, u64)>>> = Mutex::new(None);
+/// Recording-time phase breakdown is separate from submission-time refreshes.
+#[derive(Default)]
+struct HeapScanStats {
+    calls: u64,
+    visited: u64,
+    prepared: u64,
+    total_us: u64,
+    batch_us: u64,
+    state_us: u64,
+    enqueue_us: u64,
+    detailed: u64,
+}
+static HEAP_SCANS: Mutex<Option<HashMap<String, HeapScanStats>>> = Mutex::new(None);
 
 pub(crate) fn heap_scan(hash: &str, visited: u64, prepared: u64, us: u64) {
+    heap_scan_phases(hash, visited, prepared, us, None);
+}
+
+/// The validated read plan is already known before state and refresh work.
+/// `batch_us` includes its complete descriptor observation and cache lookup;
+/// the other values measure only read segments, not interleaved UAV writes.
+pub(crate) fn heap_scan_phases(
+    hash: &str,
+    visited: u64,
+    prepared: u64,
+    us: u64,
+    phases: Option<(u64, u64, u64)>,
+) {
     let mut held = HEAP_SCANS.lock().unwrap_or_else(|e| e.into_inner());
     let map = held.get_or_insert_with(HashMap::new);
-    if let Some(e) = map.get_mut(hash) {
-        e.0 += 1;
-        e.1 += visited;
-        e.2 += prepared;
-        e.3 += us;
-    } else {
-        map.insert(hash.to_owned(), (1, visited, prepared, us));
+    let e = map.entry(hash.to_owned()).or_default();
+    e.calls += 1;
+    e.visited += visited;
+    e.prepared += prepared;
+    e.total_us += us;
+    if let Some((batch, state, enqueue)) = phases {
+        e.detailed += 1;
+        e.batch_us += batch;
+        e.state_us += state;
+        e.enqueue_us += enqueue;
     }
 }
 
@@ -195,12 +222,28 @@ pub(crate) fn log(frames: f64) {
     tracing::info!("exact GPU comparisons per frame: {:.2} MB scanned on card, {:.2} MB unchanged (CPU scan omitted)", mb(c[C::CardComparedBytes as usize]), mb(c[C::CardUnchangedBytes as usize]));
     let scans = HEAP_SCANS.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut scans: Vec<_> = scans.into_iter().flatten().collect();
-    let totals = scans.iter().fold((0, 0, 0, 0), |a, (_, b)| (a.0+b.0, a.1+b.1, a.2+b.2, a.3+b.3));
-    if totals.0 != 0 {
-        tracing::info!("heap scans per frame: {:.1} calls, {:.0} visited, {:.0} prepared, {:.1} ms recording", totals.0 as f64 / frames, totals.1 as f64 / frames, totals.2 as f64 / frames, ms(totals.3 as f64 / frames));
-        scans.sort_unstable_by_key(|(_, e)| std::cmp::Reverse(e.3));
-        for (hash, (calls, slots, prepared, us)) in scans.into_iter().take(8) {
-            tracing::info!("  heap scan shader {hash}: {:.1} calls/frame, {:.0} slots/frame, {:.0} prepared/frame, {:.1} ms/frame", calls as f64 / frames, slots as f64 / frames, prepared as f64 / frames, ms(us as f64 / frames));
+    let totals = scans.iter().fold(HeapScanStats::default(), |mut a, (_, b)| {
+        a.calls += b.calls;
+        a.visited += b.visited;
+        a.prepared += b.prepared;
+        a.total_us += b.total_us;
+        a.batch_us += b.batch_us;
+        a.state_us += b.state_us;
+        a.enqueue_us += b.enqueue_us;
+        a.detailed += b.detailed;
+        a
+    });
+    if totals.calls != 0 {
+        tracing::info!("heap scans per frame: {:.1} calls, {:.0} visited, {:.0} prepared, {:.1} ms recording", totals.calls as f64 / frames, totals.visited as f64 / frames, totals.prepared as f64 / frames, ms(totals.total_us as f64 / frames));
+        if totals.detailed != 0 {
+            tracing::info!("  heap read-plan phases per frame: {:.1} detailed calls, {:.1} ms descriptor plan, {:.1} ms buffer states, {:.1} ms refresh enqueue (remaining time includes setup/UAV writes)", totals.detailed as f64 / frames, ms(totals.batch_us as f64 / frames), ms(totals.state_us as f64 / frames), ms(totals.enqueue_us as f64 / frames));
+        }
+        scans.sort_unstable_by_key(|(_, e)| std::cmp::Reverse(e.total_us));
+        for (hash, e) in scans.into_iter().take(8) {
+            tracing::info!("  heap scan shader {hash}: {:.1} calls/frame, {:.0} slots/frame, {:.0} prepared/frame, {:.1} ms/frame", e.calls as f64 / frames, e.visited as f64 / frames, e.prepared as f64 / frames, ms(e.total_us as f64 / frames));
+            if e.detailed != 0 {
+                tracing::info!("    {hash} read-plan phases: {:.1} ms batch, {:.1} ms state, {:.1} ms enqueue per frame", ms(e.batch_us as f64 / frames), ms(e.state_us as f64 / frames), ms(e.enqueue_us as f64 / frames));
+            }
         }
     }
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
