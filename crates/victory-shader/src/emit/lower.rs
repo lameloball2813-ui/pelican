@@ -22,6 +22,18 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
+// Derivatives of cube_direction for its six native face IDs. Each entry
+// selects 0, +2 ds, -2 ds, +2 dt, or -2 dt respectively. The normal axis
+// does not vary within a face; the other two retain their exact signs.
+const CUBE_GRADIENT_TERMS: [[u8; 3]; 6] = [
+    [0, 4, 2], // +X
+    [0, 4, 1], // -X
+    [1, 0, 3], // +Y
+    [1, 0, 4], // -Y
+    [1, 4, 0], // +Z
+    [2, 4, 0], // -Z
+];
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -9382,7 +9394,11 @@ impl<'a> Lower<'a> {
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
-            let grads = if op == 63 { 2 * spatial } else { 0 };
+            // A cube has three address words (s, t, face) but only two
+            // derivatives per direction. Treating its face as a third
+            // spatial coordinate overreads the native sample_d operand.
+            let grad_components = if kind == 5 { 2 } else { spatial };
+            let grads = if op == 63 { 2 * grad_components } else { 0 };
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
             let to_float = |l: &mut Self, x: V| {
@@ -9397,9 +9413,10 @@ impl<'a> Lower<'a> {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
+            let cube_face = cs[2];
             if kind == 5 {
-                if *unorm || op == 63 || op == 81 {
-                    return Err("a cube sample with texel coordinates, gradients or a level query");
+                if *unorm || op == 81 || op == 63 && *a16 {
+                    return Err("a cube sample with texel coordinates, half gradients or a level query");
                 }
                 let dir = self.cube_direction(cs[0], cs[1], cs[2]);
                 cs[..3].copy_from_slice(&dir);
@@ -9499,11 +9516,21 @@ impl<'a> Lower<'a> {
                 }
                 63 => {
                     let mut g = vec![fu; 6];
-                    for k in 0..spatial {
+                    for k in 0..grad_components {
                         let x = addr_val(self, first + k)?;
                         g[k] = to_float(self, x);
-                        let y = addr_val(self, first + spatial + k)?;
+                        let y = addr_val(self, first + grad_components + k)?;
                         g[3 + k] = to_float(self, y);
+                    }
+                    if kind == 5 {
+                        // The native gradients are of the face coordinates
+                        // (s,t), not of the cube direction. Differentiate
+                        // the same affine face-to-direction transform as
+                        // cube_direction, with its third component constant.
+                        let dx = self.cube_gradient(g[0], g[1], cube_face);
+                        let dy = self.cube_gradient(g[3], g[4], cube_face);
+                        g[..3].copy_from_slice(&dx);
+                        g[3..].copy_from_slice(&dy);
                     }
                     args.extend(&os);
                     args.extend(g);
@@ -9680,6 +9707,32 @@ impl<'a> Lower<'a> {
                 r = self.s.m.select(c, is, x, r);
             }
             r
+        })
+    }
+
+    /// Direction-space derivatives for a cube face whose original sample_d
+    /// operands are ds,dt. The exact Jacobian of cube_direction is constant
+    /// within each face; the major axis has derivative zero. The coefficient
+    /// table is shared with a finite-difference regression for all six faces.
+    fn cube_gradient(&mut self, ds: V, dt: V, face: V) -> [V; 3] {
+        let c = self.cur;
+        let two = self.s.m.f32(2.0f32.to_bits());
+        let zero = self.s.m.f32(0.0f32.to_bits());
+        let ds = self.s.m.bin(c, Bin::Mul, ds, two);
+        let dt = self.s.m.bin(c, Bin::Mul, dt, two);
+        let minus_ds = self.s.m.bin(c, Bin::Sub, zero, ds);
+        let minus_dt = self.s.m.bin(c, Bin::Sub, zero, dt);
+        let terms = [zero, ds, minus_ds, dt, minus_dt];
+        let f = self.s.m.cast(c, Cast::FpToUi, face, self.s.t.i32);
+        std::array::from_fn(|axis| {
+            let mut out = terms[CUBE_GRADIENT_TERMS[0][axis] as usize];
+            for n in 1..6 {
+                let kn = self.s.m.i32(n as u32);
+                let is = self.s.m.cmp(c, pred::EQ, f, kn);
+                let term = terms[CUBE_GRADIENT_TERMS[n][axis] as usize];
+                out = self.s.m.select(c, is, term, out);
+            }
+            out
         })
     }
 

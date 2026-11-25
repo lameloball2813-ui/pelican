@@ -1131,3 +1131,43 @@
         ];
         lowers(&oob_rels, 0).unwrap();
     }
+
+    #[test]
+    fn cube_gradients_match_affine_face_directions() {
+        // Independently differentiate the same native s,t,face convention
+        // used for ordinary cube samples; never treat the face index as a
+        // third derivative. Cover all faces and asymmetric signed gradients.
+        fn direction(s: f32, t: f32, face: usize) -> [f32; 3] {
+            let u = 2.0 * s - 3.0;
+            let v = 2.0 * t - 3.0;
+            match face {
+                0 => [1.0, -v, -u],
+                1 => [-1.0, -v, u],
+                2 => [u, 1.0, v],
+                3 => [u, -1.0, -v],
+                4 => [u, -v, 1.0],
+                5 => [-u, -v, -1.0],
+                _ => unreachable!(),
+            }
+        }
+        for face in 0..6 {
+            for (s, t, ds, dt) in [
+                (1.25, 1.75, 0.125, -0.0625),
+                (1.5, 1.5, -0.25, 0.03125),
+                (1.01, 1.98, 0.0, 0.125),
+                (1.99, 1.02, 0.0625, 0.0),
+            ] {
+                let a = direction(s, t, face);
+                let b = direction(s + ds, t + dt, face);
+                let terms = [0.0, 2.0 * ds, -2.0 * ds, 2.0 * dt, -2.0 * dt];
+                let got = super::CUBE_GRADIENT_TERMS[face].map(|i| terms[i as usize]);
+                for axis in 0..3 {
+                    assert!(
+                        (got[axis] - (b[axis] - a[axis])).abs() <= 1.0e-5,
+                        "face {face} axis {axis}: expected {}, got {}",
+                        b[axis] - a[axis], got[axis],
+                    );
+                }
+            }
+        }
+    }

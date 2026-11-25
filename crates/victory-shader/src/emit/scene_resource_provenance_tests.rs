@@ -42,3 +42,36 @@ fn original_scene_spilled_constant_pointers_stay_rejected() {
         && e.slot == 8 && e.user_data == 32 && e.sgprs == 14),
         "original pointer-bearing root constants are slot 8 dwords 0..13");
 }
+
+/// A cube's original sample_d layout has two gradients per screen direction
+/// followed by three face coordinates. The 3D DXIL gradients are obtained by
+/// differentiating those face coordinates, never by reading nonexistent
+/// eighth/ninth derivative registers.
+#[test]
+fn original_scene_cube_gradient_pixel_shader_validates() {
+    let Some(dir) = std::env::var_os("VICTORY_MESH_DESCRIPTOR_DIR") else { return };
+    let path = std::path::PathBuf::from(dir).join("pixel-7bdefdfde461f6e3.cso");
+    let bytes = std::fs::read(path).expect("external cube-gradient pixel fixture");
+    let c = Container::parse(&bytes).unwrap();
+    let native = crate::native_programs(c.part(FourCC::DXIL).unwrap().data)
+        .unwrap().into_iter().find(|n| n.stage == HwStage::Ps).unwrap();
+    let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+    let gradients: Vec<_> = p.blocks.iter().flat_map(|bb| &bb.insts)
+        .filter(|i| i.name().starts_with("image_sample_d"))
+        .map(|i| i.machine.offset).collect();
+    assert!(gradients.contains(&0x2abc), "original cube gradient location changed: {gradients:x?}");
+    assert!(gradients.len() >= 3, "expected cube-gradient sampling sites: {gradients:x?}");
+    let shader = super::translate(&bytes).expect("cube gradients should translate");
+    let mut dxil = shader.dxil;
+    super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+        .expect("DXIL validator")
+        .validate(&mut dxil)
+        .expect("original scene cube-gradient DXIL validation");
+    // Pipeline creation on the actual default GPU is a separate requirement
+    // from validation: root-resource declarations and driver acceptance must
+    // agree. This doesn't purport to compare native texture filtering.
+    let host = super::host::Host::new(false).expect("NVIDIA SM6.6 device");
+    host.root_signature_for(&[(&super::translate(&bytes).unwrap(),
+        windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_PIXEL)])
+        .expect("original pixel shader root signature");
+}
