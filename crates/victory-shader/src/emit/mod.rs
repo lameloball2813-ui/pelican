@@ -101,6 +101,8 @@ mod bvh_scan_tests;
 mod prison_wave64_tests;
 #[cfg(all(test, windows))]
 mod root_uav_original_tests;
+#[cfg(all(test, windows))]
+mod scene_resource_provenance_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
