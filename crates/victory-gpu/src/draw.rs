@@ -637,11 +637,7 @@ impl State {
                 for (shadow, _) in ranges {
                     shadow.ensure_state(list, 0x40 | 0x80);
                 }
-                for (shadow, intervals) in ranges {
-                    for &(start, end) in intervals {
-                        shadow.refresh(list, start, end - start);
-                    }
-                }
+                list.defer_refresh_run(ranges);
             };
             replay_reads(&plan.ranges);
             for step in &plan.ordered {

@@ -684,6 +684,37 @@ struct Deferred {
     title_write_epoch: u64,
 }
 
+impl Deferred {
+    /// Shared scalar/bulk registration: retain exactly the same range
+    /// coverage and Step order, independent of how many times the mutex is
+    /// acquired by its caller.
+    fn record_refresh(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if self.refreshed.insert(key, address, len) {
+            self.copies.push(Step::Refresh(shadow.clone(), address, len));
+        }
+    }
+}
+
+/// Apply the scalar registration primitive in the exact original read order.
+/// Caller controls the title-write boundary and lock lifetime.
+fn record_refresh_run(
+    deferred: &mut Deferred,
+    ranges: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(u64, u64)>)],
+) {
+    for (shadow, intervals) in ranges {
+        for &(start, end) in intervals {
+            let len = (end - start).min(shadow.left(start));
+            deferred.record_refresh(shadow, start as usize, len as usize);
+        }
+    }
+}
+
 /// Recording-time coverage, not a write-watch cache. Never infer contents
 /// from this map across a title write, list reset, or submission.
 #[derive(Default)]
@@ -1625,12 +1656,19 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if deferred.refreshed.insert(key, address, len) {
-            deferred
-                .copies
-                .push(Step::Refresh(shadow.clone(), address, len));
-        }
+        deferred.record_refresh(shadow, address, len);
+    }
+
+    /// Record an ordered run of certified heap SRV reads under one lock.
+    /// The caller has already ensured resource states. This deliberately does
+    /// not coalesce requests across shadows, reorder intervals or cross a
+    /// PlanStep::Write (which must remain outside the lock and between runs).
+    pub(crate) fn defer_refresh_run(
+        &self,
+        ranges: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(u64, u64)>)],
+    ) {
+        let mut deferred = self.deferred();
+        record_refresh_run(&mut deferred, ranges);
     }
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
@@ -3003,6 +3041,89 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(!c.insert(1, 100, 0));
         c.clear();
         assert!(c.insert(1, 120, 60));
+    }
+
+    #[test]
+    fn deferred_refresh_run_matches_scalar_steps_across_writes_and_reset() {
+        use super::Step;
+        // Two real, independent shadows with overlapping original title
+        // addresses are important: deduplication is by Arc, never title VA.
+        let base = 0x1d1100000u64;
+        crate::shadow::register(0x71101, base, 4096);
+        struct Unregister(u64);
+        impl Drop for Unregister {
+            fn drop(&mut self) {
+                crate::shadow::unregister(0x71101, self.0);
+                crate::shadow::unregister(0x71102, self.0);
+            }
+        }
+        let _unregister = Unregister(base);
+        let a = crate::shadow::find(base, 4096).expect("first real shadow");
+        // Make a new independent shadow on the same title VA only after
+        // retaining the first: a title may release/recreate a buffer while
+        // an older list still holds the original mirror.
+        crate::shadow::unregister(0x71101, base);
+        crate::shadow::register(0x71102, base, 4096);
+        let b = crate::shadow::find(base, 4096).expect("second real shadow");
+        assert!(!Arc::ptr_eq(&a, &b));
+
+        let read_runs = [
+            vec![
+                (a.clone(), vec![(base + 10, base + 100), (base + 10, base + 100),
+                    (base + 99, base + 170), (base + 170, base + 190),
+                    (base + 4080, base + 4096)]),
+                (b.clone(), vec![(base + 10, base + 100), (base + 50, base + 200)]),
+            ],
+            vec![
+                (a.clone(), vec![(base + 11, base + 40), (base + 250, base + 280)]),
+                (b.clone(), vec![(base + 100, base + 180)]),
+            ],
+        ];
+        let mut scalar = super::Deferred::default();
+        let mut bulk = super::Deferred::default();
+        let snapshot = |deferred: &super::Deferred| {
+            let steps = deferred.copies.iter().map(|step| match step {
+                Step::Refresh(shadow, address, len) =>
+                    (0u8, Arc::as_ptr(shadow) as usize, *address, *len),
+                Step::Copy(dst, src, len) => (1, *dst, *src, *len),
+                Step::Run(_) => (2, 0, 0, 0),
+                Step::GpuWrite(shadow, address, len) =>
+                    (3, Arc::as_ptr(shadow) as usize, *address, *len),
+                _ => panic!("unexpected step in equivalence fixture"),
+            }).collect::<Vec<_>>();
+            (steps, deferred.refreshed.0.clone(), deferred.title_write_epoch)
+        };
+        for (i, ranges) in read_runs.iter().enumerate() {
+            for (shadow, intervals) in ranges {
+                for &(start, end) in intervals {
+                    scalar.record_refresh(shadow, start as usize,
+                        (end - start).min(shadow.left(start)) as usize);
+                }
+            }
+            super::record_refresh_run(&mut bulk, ranges);
+            assert_eq!(snapshot(&scalar), snapshot(&bulk));
+            if i == 0 {
+                for deferred in [&mut scalar, &mut bulk] {
+                    deferred.title_write_epoch += 1;
+                    deferred.copies.push(Step::Copy(0, 0, 0));
+                    deferred.refreshed.clear();
+                    deferred.copies.push(Step::Run(Box::new(|| {})));
+                    deferred.refreshed.clear();
+                }
+                assert_eq!(snapshot(&scalar), snapshot(&bulk));
+            }
+        }
+        scalar = super::Deferred::default();
+        bulk = super::Deferred::default();
+        assert_eq!(snapshot(&scalar), snapshot(&bulk));
+        for (shadow, intervals) in &read_runs[0] {
+            for &(start, end) in intervals {
+                scalar.record_refresh(shadow, start as usize,
+                    (end - start).min(shadow.left(start)) as usize);
+            }
+        }
+        super::record_refresh_run(&mut bulk, &read_runs[0]);
+        assert_eq!(snapshot(&scalar), snapshot(&bulk));
     }
 
     #[test]

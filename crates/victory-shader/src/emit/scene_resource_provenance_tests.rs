@@ -50,30 +50,54 @@ fn original_scene_spilled_constant_pointers_stay_rejected() {
 #[test]
 fn original_scene_cube_gradient_pixel_shader_validates() {
     let Some(dir) = std::env::var_os("VICTORY_MESH_DESCRIPTOR_DIR") else { return };
-    let path = std::path::PathBuf::from(dir).join("pixel-7bdefdfde461f6e3.cso");
-    let bytes = std::fs::read(path).expect("external cube-gradient pixel fixture");
-    let c = Container::parse(&bytes).unwrap();
-    let native = crate::native_programs(c.part(FourCC::DXIL).unwrap().data)
-        .unwrap().into_iter().find(|n| n.stage == HwStage::Ps).unwrap();
-    let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
-    let gradients: Vec<_> = p.blocks.iter().flat_map(|bb| &bb.insts)
-        .filter(|i| i.name().starts_with("image_sample_d"))
-        .map(|i| i.machine.offset).collect();
-    assert!(gradients.contains(&0x2abc), "original cube gradient location changed: {gradients:x?}");
-    assert!(gradients.len() >= 3, "expected cube-gradient sampling sites: {gradients:x?}");
-    let shader = super::translate(&bytes).expect("cube gradients should translate");
-    let mut dxil = shader.dxil;
-    super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
-        .expect("DXIL validator")
-        .validate(&mut dxil)
-        .expect("original scene cube-gradient DXIL validation");
+    let dir = std::path::PathBuf::from(dir);
+    let mut validator = super::validator::Validator::load(
+        super::validator::Validator::default_path().as_deref())
+        .expect("DXIL validator");
     // Pipeline creation on the actual default GPU is a separate requirement
     // from validation: root-resource declarations and driver acceptance must
     // agree. This doesn't purport to compare native texture filtering.
     let host = super::host::Host::new(false).expect("NVIDIA SM6.6 device");
-    host.root_signature_for(&[(&super::translate(&bytes).unwrap(),
-        windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_PIXEL)])
-        .expect("original pixel shader root signature");
+    for (hash, first) in [
+        ("7bdefdfde461f6e3", 0x2abc),
+        ("ee41ebc3eb3fbbdc", 0x39c4),
+        ("2deec721a63fe8a5", 0x2824),
+    ] {
+        let path = dir.join(format!("pixel-{hash}.cso"));
+        let bytes = std::fs::read(path).expect("external cube-gradient pixel fixture");
+        let c = Container::parse(&bytes).unwrap();
+        let native = crate::native_programs(c.part(FourCC::DXIL).unwrap().data)
+            .unwrap().into_iter().find(|n| n.stage == HwStage::Ps).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let gradients: Vec<_> = p.blocks.iter().flat_map(|bb| &bb.insts)
+            .filter(|i| i.name().starts_with("image_sample_d"))
+            .map(|i| i.machine.offset).collect();
+        assert!(gradients.contains(&first),
+            "{hash}: original cube gradient location changed: {gradients:x?}");
+        assert!(gradients.len() >= 3, "{hash}: expected cube-gradient sampling sites");
+        for inst in p.blocks.iter().flat_map(|bb| &bb.insts)
+            .filter(|i| i.name().starts_with("image_sample_d")
+                && matches!(i.fields, crate::gfx10::Fields::Image { dim: 3, .. })) {
+            let crate::gfx10::Fields::Image { dim, a16, addr, .. } = &inst.fields else {
+                unreachable!()
+            };
+            assert_eq!(*dim, 3, "{hash} {:#x}: cube dimension", inst.machine.offset);
+            assert!(!*a16, "{hash} {:#x}: unexpected half-gradient format", inst.machine.offset);
+            let words: usize = addr.iter().map(|op| match op {
+                crate::gfx10::Operand::Vector { dwords, .. } => usize::from(*dwords),
+                _ => panic!("{hash}: image gradient address not VGPR"),
+            }).sum();
+            assert!(matches!(words, 7 | 8), "{hash} {:#x}: unexpected {words} native address words", inst.machine.offset);
+        }
+        let shader = super::translate(&bytes)
+            .unwrap_or_else(|e| panic!("{hash}: cube gradients should translate: {e}"));
+        let mut dxil = shader.dxil.clone();
+        validator.validate(&mut dxil)
+            .unwrap_or_else(|e| panic!("{hash}: invalid cube-gradient DXIL: {e}"));
+        host.root_signature_for(&[(&shader,
+            windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_PIXEL)])
+            .unwrap_or_else(|e| panic!("{hash}: root signature: {e}"));
+    }
 }
 
 /// Diagnostic for the original water/material 2D descriptor metadata path.
