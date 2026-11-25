@@ -18,8 +18,10 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+use windows::core::Interface;
 
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
@@ -45,6 +47,8 @@ pub(crate) struct Shadow {
     before: Mutex<Option<(usize, Vec<u8>)>>,
     /// Current D3D12 resource state of this buffer copy.
     state: AtomicU32,
+    /// Last lookup of this copy; loose windows may be retired only when idle.
+    used: Mutex<(Instant, u64)>,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -121,6 +125,7 @@ impl Shadow {
             pending: Mutex::default(),
             before: Mutex::default(),
             state: AtomicU32::new(0), // D3D12_RESOURCE_STATE_COMMON
+            used: Mutex::new((Instant::now(), crate::frame::current())),
         }
     }
 
@@ -461,18 +466,94 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
-/// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
 const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+fn idle(now: (Instant, u64), used: (Instant, u64)) -> bool {
+    now.0.saturating_duration_since(used.0) > Duration::from_secs(10)
+        && now.1.saturating_sub(used.1) >= 4
+}
+
+/// The temporary AddRef/Release pair leaves the COM reference count unchanged.
+/// Descriptor slots hold COM references independently of the Shadow Arc.
+fn resource_references(resource: &ID3D12Resource) -> u32 {
+    type Method = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
+    let raw = resource.as_raw();
+    // SAFETY: a live COM object's first three vtable entries are IUnknown.
+    unsafe {
+        let methods = *raw.cast::<*const [Method; 3]>();
+        ((*methods)[1])(raw);
+        ((*methods)[2])(raw)
+    }
+}
+
+/// Reclaim only loose windows that neither a list nor a descriptor holds.
+/// Call after the reset list's last submission and copy-back completed.
+/// Other lists must retain their resources until their submissions finish.
+/// Holding LOOSE through the check and removal prevents concurrent lookups
+/// from acquiring a reference between them. Registered buffers are untouched.
+pub(crate) fn let_go_idle() {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
+        return;
+    }
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let now = (Instant::now(), crate::frame::current());
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|at| now.0.saturating_duration_since(at) < Duration::from_secs(1)) {
+            return;
+        }
+        *last = Some(now.0);
+    }
+    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut removed = 0u64;
+    let mut bytes = 0u64;
+    map.retain(|_, s| {
+        let mut used = s.used.lock().unwrap_or_else(|e| e.into_inner());
+        let unreferenced = Arc::strong_count(s) == 1
+            && s.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            && s.before.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+            && resource_references(&s.buffer) == 1;
+        // A retained descriptor or list may be used without a fresh lookup.
+        // Require the full idle period after the last observation of a pin.
+        if !unreferenced {
+            *used = now;
+            return true;
+        }
+        let reclaim = idle(now, *used);
+        if reclaim {
+            removed += 1;
+            bytes += s.len;
+        }
+        !reclaim
+    });
+    #[cfg(feature = "diagnostics")]
+    tracing::info!(
+        removed,
+        bytes,
+        live_windows = map.len(),
+        live_bytes = map.values().map(|s| s.len).sum::<u64>(),
+        "loose shadow window sweep"
+    );
+    #[cfg(not(feature = "diagnostics"))]
+    if removed != 0 {
+        tracing::debug!(removed, bytes, "loose shadow window sweep");
+    }
+}
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(shadow) = map.get(&(start, len)) {
+        *shadow.used.lock().unwrap_or_else(|e| e.into_inner()) =
+            (Instant::now(), crate::frame::current());
         return Some(shadow.clone());
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -524,6 +605,19 @@ pub(crate) fn near(va: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_requires_both_time_and_frames() {
+        let t = Instant::now();
+        let used = (t, 20);
+        assert!(!idle((t + Duration::from_secs(10), 24), used));
+        assert!(!idle((t + Duration::from_secs(11), 23), used));
+        assert!(!idle((t + Duration::from_secs(11), 19), used));
+        assert!(idle(
+            (t + Duration::from_secs(10) + Duration::from_millis(1), 24),
+            used
+        ));
+    }
 
     #[test]
     fn shadow_buffer_transitions_state_when_requested() {

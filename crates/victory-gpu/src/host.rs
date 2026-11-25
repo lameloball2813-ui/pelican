@@ -959,6 +959,10 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         *self.deferred() = Deferred::default();
+        // The last GPU submission was waited for before reset, and this
+        // list's shader-written shadows are no longer retained. Only now
+        // may unused loose host copies be checked for safe reclamation.
+        crate::shadow::let_go_idle();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -1307,9 +1311,10 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// A submission's refreshes not done yet, merged per buffer copy into
+/// disjoint overlapping/adjacent intervals. Previously the first and last
+/// requests formed one enclosing range, which also scanned untouched gaps
+/// between distant views of the same large title buffer.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
@@ -1317,21 +1322,44 @@ impl HostList {
 /// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
 impl Batch {
+    /// Insert `[from, to)` into sorted non-overlapping intervals without
+    /// adding any bytes outside the union of the requested ranges.
+    fn add_interval(intervals: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let i = intervals.partition_point(|&(_, end)| end < from);
+        let mut merged = (from, to);
+        let mut j = i;
+        while j < intervals.len() && intervals[j].0 <= merged.1 {
+            merged.0 = merged.0.min(intervals[j].0);
+            merged.1 = merged.1.max(intervals[j].1);
+            j += 1;
+        }
+        intervals.splice(i..j, [merged]);
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
+        let Some(end) = address.checked_add(len) else {
+            return;
+        };
         match self
             .refreshes
             .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
+            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
         {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+            Some((_, intervals)) => Self::add_interval(intervals, address, end),
+            None => {
+                let mut intervals = Vec::with_capacity(1);
+                Self::add_interval(&mut intervals, address, end);
+                self.refreshes.push((shadow.clone(), intervals));
+            }
         }
     }
 
@@ -1349,14 +1377,16 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        for (shadow, intervals) in self.refreshes.drain(..) {
+            for (from, to) in intervals {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(from, to - from);
+                let us = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::range(from, to - from, us, 0);
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
+                PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -2062,6 +2092,49 @@ fn pump() {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::Batch;
     use std::sync::Arc;
+
+    #[test]
+    fn refresh_intervals_keep_gaps_and_merge_overlaps() {
+        let mut intervals = Vec::new();
+        for (from, to) in [
+            (100, 200),
+            (400, 500),
+            (150, 250),
+            (300, 350),
+            (250, 300),
+            (500, 550),
+            (45, 45),
+        ] {
+            Batch::add_interval(&mut intervals, from, to);
+        }
+        assert_eq!(intervals, [(100, 350), (400, 550)]);
+    }
+
+    #[test]
+    fn refresh_intervals_equal_the_union_in_any_order() {
+        let ranges = [
+            (5, 10),
+            (7, 19),
+            (0, 1),
+            (40, 41),
+            (25, 31),
+            (1, 5),
+            (31, 40),
+            (10, 27),
+        ];
+        for order in [ranges.to_vec(), ranges.into_iter().rev().collect()] {
+            let mut intervals = Vec::new();
+            let mut wanted = [false; 48];
+            for (from, to) in order {
+                wanted[from..to].fill(true);
+                Batch::add_interval(&mut intervals, from, to);
+                assert!(intervals.windows(2).all(|w| w[0].1 < w[1].0));
+                for (i, is_set) in wanted.iter().enumerate() {
+                    assert_eq!(intervals.iter().any(|&(a, b)| a <= i && i < b), *is_set);
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {
