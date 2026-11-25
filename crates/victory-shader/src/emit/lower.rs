@@ -3544,6 +3544,54 @@ impl<'a> Lower<'a> {
     // level 0, so sizes the code shifts by it come out right) and the other
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
+    /// Bindless image descriptors read only to calculate their dimensions have
+    /// no direct image instruction to identify the view. Require the GFX10
+    /// width, height, and base-mip extraction pattern, and evidence of 2D
+    /// sampling from the same heap, before reconstructing their dimensions.
+    fn bindless_2d_size_load(&self, inst: &Inst, site: Site, code: u8) -> bool {
+        let Some(a) = self.scalar.get(&site) else {
+            return false;
+        };
+        if !matches!(self.x.native.layout.get(a.param), Some(p) if p.root == RootType::ResourceHeap)
+            || a.dynamic.is_none()
+            || a.offset != 0
+        {
+            return false;
+        }
+        let [Some(d1), Some(d2), Some(d3)] = [
+            inst.write(Reg::S(code + 1)),
+            inst.write(Reg::S(code + 2)),
+            inst.write(Reg::S(code + 3)),
+        ] else {
+            return false;
+        };
+        let has = |value, name, second| {
+            self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                i.name() == name
+                    && i.reads.iter().any(|&(_, v)| v == value)
+                    && matches!(&i.fields, Fields::Sop { src, .. } if src.get(1) == Some(&second))
+            })
+        };
+        // d1[31:30], d2[13:0] => width - 1; d2[29:14] => height - 1;
+        // d3[15:12] => base mip. No arbitrary descriptor words are invented.
+        if !has(d1, "s_lshr_b32", Operand::Const(158))
+            || !has(d2, "s_lshl_b32", Operand::Const(130))
+            || !has(d2, "s_bfe_u32", Operand::Literal(0x0010_000e))
+            || !has(d3, "s_bfe_u32", Operand::Literal(0x0004_000c))
+        {
+            return false;
+        }
+        self.x.res.descriptors.iter().any(|d| {
+            let use_inst = &self.x.p.blocks[d.site.0].insts[d.site.1];
+            d.role == Role::Resource
+                && use_inst.name().starts_with("image_sample")
+                && matches!(&use_inst.fields, Fields::Image { dim: 1, .. })
+                && d.source.leaves().iter().any(|source| {
+                    matches!(source, Source::Loaded { load, .. } if self.scalar.get(load).is_some_and(|other| other.param == a.param))
+                })
+        })
+    }
+
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         if self.atomic_descriptor_loads.contains(&site) {
             return Ok(());
@@ -3623,29 +3671,35 @@ impl<'a> Lower<'a> {
                 load: site,
                 first: 0,
             };
-            let Some(used) = self.used_kind(&src) else {
-                return Err("a descriptor read only as data");
-            };
-            if used.kind == ResourceType::Cbv {
-                return Err("a constant buffer's descriptor read as data");
-            }
-            if !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
-                return Err("a descriptor read only as data");
-            }
-            let uav = used.kind == ResourceType::Uav;
-            let u = if uav { 0x1000 } else { 0 };
-            let (props, image) = if used.dwords == 4 {
-                let stride = used.stride;
-                let props = if stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
-                } else {
-                    (11 | u, 0)
-                };
-                (props, None)
+            if count == 8 && self.bindless_2d_size_load(inst, site, code) {
+                // This handle uses the original descriptor's *own* dynamic
+                // heap index, not the different indices sampled afterwards.
+                (src, false, (2, 0x409), Some(2))
             } else {
-                ((2 | u, 0x409), Some(2))
-            };
-            (src, uav, props, image)
+                let Some(used) = self.used_kind(&src) else {
+                    return Err("a descriptor read only as data");
+                };
+                if used.kind == ResourceType::Cbv {
+                    return Err("a constant buffer's descriptor read as data");
+                }
+                if !matches!(used.kind, ResourceType::Srv | ResourceType::Uav) {
+                    return Err("a descriptor read only as data");
+                }
+                let uav = used.kind == ResourceType::Uav;
+                let u = if uav { 0x1000 } else { 0 };
+                let (props, image) = if used.dwords == 4 {
+                    let stride = used.stride;
+                    let props = if stride >= 4 && stride.is_multiple_of(4) {
+                        (12 | u, stride)
+                    } else {
+                        (11 | u, 0)
+                    };
+                    (props, None)
+                } else {
+                    ((2 | u, 0x409), Some(2))
+                };
+                (src, uav, props, image)
+            }
         };
         let Source::Loaded { first, .. } = src else {
             unreachable!()
