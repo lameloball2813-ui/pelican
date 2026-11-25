@@ -75,3 +75,53 @@ fn original_scene_cube_gradient_pixel_shader_validates() {
         windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_PIXEL)])
         .expect("original pixel shader root signature");
 }
+
+/// Diagnostic for the original water/material 2D descriptor metadata path.
+/// Record each scalar descriptor-load site and its exact SSA consumers before
+/// changing production provenance checks. In particular, extracting width,
+/// height and base mip from three *separate* loads must never be mistaken for
+/// one descriptor of an unrelated heap slot.
+#[test]
+fn original_scene_a7a20_separate_dimension_loads_audit() {
+    let Some(dir) = std::env::var_os("VICTORY_MESH_DESCRIPTOR_DIR") else { return };
+    let bytes = std::fs::read(std::path::PathBuf::from(dir)
+        .join("pixel-a7a20f06a33260f9.cso")).unwrap();
+    let c = Container::parse(&bytes).unwrap();
+    let native = crate::native_programs(c.part(FourCC::DXIL).unwrap().data)
+        .unwrap().into_iter().find(|n| n.stage == HwStage::Ps).unwrap();
+    let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+    let st = st.unwrap();
+    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let offset = |off: usize| p.blocks.iter().flat_map(|b| &b.insts)
+        .find(|i| i.machine.offset == off).unwrap();
+    let mut signatures = Vec::new();
+    for off in [0x550, 0x590, 0x5c8] {
+        let i = offset(off);
+        assert_eq!(i.name(), "s_load_dwordx8");
+        let site = p.blocks.iter().enumerate().find_map(|(b, bb)| bb.insts.iter()
+            .position(|i| i.machine.offset == off).map(|j| (b,j))).unwrap();
+        let (_, a) = res.scalar.iter().find(|(s,_)| *s == site).unwrap();
+        let dynamic = a.dynamic.unwrap();
+        // The three scalar first-lane reads are distinct SSA definitions of
+        // the same VGPR input, under three separate EXEC snapshots.
+        let origin = p.blocks.iter().flat_map(|bb| &bb.insts)
+            .find(|w| w.writes.iter().any(|&(_, v)| v == dynamic))
+            .expect("first-lane index for this descriptor load");
+        assert_eq!(origin.name(), "v_readfirstlane_b32");
+        assert_eq!(origin.read(crate::ir::Reg::V(18)), Some(crate::ir::Value(1065)),
+            "all descriptor reads use the original per-lane index");
+        // These three scalar metadata reads are NOT yet among the resource
+        // tracker's certified descriptor waterfalls. Their shared VGPR
+        // address alone does not prove lane equivalence after EXEC changes;
+        // keep the original pipeline unsupported until that is proven.
+        assert!(!res.waterfall.reads.contains(&dynamic));
+        signatures.push((a.param, a.offset, a.dynamic));
+    }
+    // SSA differs because the native waterfall reloads the scalar index in
+    // three blocks. Do not assume those values are identical from the root
+    // parameter alone: the proving pass must inspect their defining chains.
+    assert!(signatures.windows(2).all(|w| w[0].0 == w[1].0 && w[0].1 == w[1].1));
+    assert!(signatures.windows(2).all(|w| w[0].2 != w[1].2));
+    assert!(matches!(super::translate(&bytes), Err(ShaderError::Unsupported { .. })),
+        "this audit must be retired or upgraded when the real original pixel shader is supported");
+}
