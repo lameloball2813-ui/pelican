@@ -276,3 +276,35 @@ fn original_scene_pixel_saved_exec_phi_audit() {
         }) if offset == failure), "must not invent a lane mask at {hash} {failure:#x}");
     }
 }
+
+/// Original high-frequency prison compute dispatches use scalar values in
+/// root-constant slots as memory pointers. A slot containing bits that look
+/// like a VA is not a root descriptor. Keep each access rejected until the
+/// title's full GPU-VA relocation and atomic/alias model is implemented.
+#[test]
+fn original_scene_compute_constant_slot_addresses_stay_guarded() {
+    let Some(dir) = std::env::var_os("VICTORY_MESH_DESCRIPTOR_DIR") else { return };
+    for (hash, site, reason) in [
+        ("162216b9cfd91aaf", 0x60usize, "an address from a root parameter that is no address"),
+        ("3df629ffc3d0a2a6", 0x3c, "an address from a root parameter that is no address"),
+        ("6f6a359d1166bb27", 0xb4, "an address from a root parameter that is no address"),
+        ("f28a33a89eaa2caa", 0xb4, "an address from a root parameter that is no address"),
+        ("4b5aedc0e96b0770", 0x90, "an address not from a root parameter"),
+    ] {
+        let bytes = std::fs::read(std::path::PathBuf::from(&dir)
+            .join(format!("compute-{hash}.cso"))).expect("original scene compute fixture");
+        let c = Container::parse(&bytes).unwrap();
+        let native = crate::native_programs(c.part(FourCC::DXIL).unwrap().data)
+            .unwrap().into_iter().find(|n| n.stage == HwStage::Cs).unwrap();
+        let (mut p, structured) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)
+            .expect("original native compute SSA");
+        let mut st = structured;
+        if crate::spill::is_spilled(&native) && crate::spill::user_data(&mut p, &native) != 0 {
+            st = crate::structure::structure(&p);
+        }
+        let err = crate::resource::track(&p, &native.layout, native.stage, st.as_ref().ok())
+            .expect_err("root-constant GPU addresses require relocation, not guessed descriptors");
+        assert_eq!(err, ShaderError::Unsupported { offset: site, what: reason },
+            "{hash}: original root-pointer refusal changed");
+    }
+}
