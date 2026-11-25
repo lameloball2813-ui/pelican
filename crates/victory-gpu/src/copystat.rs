@@ -58,6 +58,13 @@ pub(crate) enum C {
     PhysicalWriteUs,
     PhysicalWriteRuns,
     BackKernelWriteRuns,
+    PhysicalWriteAttemptUs,
+    PhysicalWriteRefusedUs,
+    PhysicalWriteRefusedBytes,
+    PhysicalWriteRefusedRuns,
+    PhysicalWriteRefusedGroups,
+    PhysicalWriteSucceededGroups,
+    BackKernelWriteBytes,
     CardUploadBytes,
     CardDownloadBytes,
     CardUploadCopies,
@@ -67,6 +74,16 @@ pub(crate) enum C {
 }
 const COUNTERS: usize = C::CardUnchangedBytes as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+const REFUSAL_BINS: usize = crate::host::PhysicalWriteRefusal::COUNT + 2;
+static PHYSICAL_REFUSALS: [AtomicU64; REFUSAL_BINS] = [const { AtomicU64::new(0) }; REFUSAL_BINS];
+
+/// The caller aggregates one complete sparse title span before publishing
+/// reasons; never add an atomic operation for each byte or each page run.
+pub(crate) fn physical_refusals(bins: &[u64; REFUSAL_BINS]) {
+    for (counter, &value) in PHYSICAL_REFUSALS.iter().zip(bins) {
+        if value != 0 { counter.fetch_add(value, Relaxed); }
+    }
+}
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
@@ -218,6 +235,17 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!("stable physical alias reads per frame: {:.1} MB, {:.1} ms", mb(c[C::PhysicalReadBytes as usize]), ms(c[C::PhysicalReadUs as usize]));
     tracing::info!("stable physical alias writes per frame: {:.1} MB, {:.1} ms, {:.0} runs; kernel fallback {:.0} runs", mb(c[C::PhysicalWriteBytes as usize]), ms(c[C::PhysicalWriteUs as usize]), c[C::PhysicalWriteRuns as usize], c[C::BackKernelWriteRuns as usize]);
+    tracing::info!("physical alias write attempts per frame: {:.0} successful pages, {:.0} refused pages, {:.1} MB refused, {:.0} refused runs, {:.1} ms attempts ({:.1} ms refused); kernel fallback {:.1} MB", c[C::PhysicalWriteSucceededGroups as usize], c[C::PhysicalWriteRefusedGroups as usize], mb(c[C::PhysicalWriteRefusedBytes as usize]), c[C::PhysicalWriteRefusedRuns as usize], ms(c[C::PhysicalWriteAttemptUs as usize]), ms(c[C::PhysicalWriteRefusedUs as usize]), mb(c[C::BackKernelWriteBytes as usize]));
+    for (i, counter) in PHYSICAL_REFUSALS.iter().enumerate() {
+        let groups = counter.swap(0, Relaxed);
+        if groups != 0 {
+            let label = if i == crate::host::PhysicalWriteRefusal::COUNT { "disabled" }
+                else if i == crate::host::PhysicalWriteRefusal::COUNT + 1 { "uninstalled" }
+                else { crate::host::PhysicalWriteRefusal::NAMES[i] };
+            tracing::info!(reason=label, pages_per_frame=groups as f64 / frames,
+                "physical alias write refusal");
+        }
+    }
     tracing::info!("VRAM shadow transfers per frame: {:.2} MB up ({:.1} copies), {:.2} MB down ({:.1} copies); {:.1} MB live card backing", mb(c[C::CardUploadBytes as usize]), c[C::CardUploadCopies as usize], mb(c[C::CardDownloadBytes as usize]), c[C::CardDownloadCopies as usize], mb(crate::shadow::card_bytes() as f64));
     tracing::info!("exact GPU comparisons per frame: {:.2} MB scanned on card, {:.2} MB unchanged (CPU scan omitted)", mb(c[C::CardComparedBytes as usize]), mb(c[C::CardUnchangedBytes as usize]));
     let scans = HEAP_SCANS.lock().unwrap_or_else(|e| e.into_inner()).take();

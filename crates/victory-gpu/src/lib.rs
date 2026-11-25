@@ -60,7 +60,7 @@ mod twin;
 mod watch;
 
 #[cfg(windows)]
-pub use host::{on_failure, use_physical_reader, use_physical_writer};
+pub use host::{on_failure, use_physical_reader, use_physical_writer, PhysicalWriteRefusal};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use host::diagnostic_memory;
 #[cfg(windows)]

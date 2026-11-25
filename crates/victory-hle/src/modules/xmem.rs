@@ -679,27 +679,30 @@ pub unsafe fn read_physical_alias(dst: *mut u8, src: *const u8, len: usize) -> b
 /// The caller must hold the title write guard; failure writes nothing.
 /// # Safety
 /// `src` is independent host memory, and `dst` names the intended title span.
-pub unsafe fn write_physical_alias_runs(dst: *mut u8, src: &[u8], runs: &[(usize, usize)]) -> bool {
+pub unsafe fn write_physical_alias_runs(dst: *mut u8, src: &[u8], runs: &[(usize, usize)]) -> Result<(), victory_gpu::PhysicalWriteRefusal> {
+    use victory_gpu::PhysicalWriteRefusal as Refusal;
     #[cfg(not(target_arch = "x86_64"))]
-    { let _ = (dst, src, runs); false }
+    { let _ = (dst, src, runs); Err(Refusal::UnsupportedArch) }
     #[cfg(target_arch = "x86_64")]
     {
         use windows_sys::Win32::System::Memory::{MEM_MAPPED, PAGE_READWRITE, VirtualQuery};
-        let (Some(&(first, _)), Some(&(_, last))) = (runs.first(), runs.last()) else { return false; };
-        if first >= last || runs.iter().any(|&(a,b)| a >= b || b > src.len()) || runs.windows(2).any(|p| p[0].1 > p[1].0) { return false; }
-        let (Some(start), Some(end)) = ((dst as usize).checked_add(first), (dst as usize).checked_add(last)) else { return false; };
-        if start / PAGE != (end - 1) / PAGE { return false; }
+        let (Some(&(first, _)), Some(&(_, last))) = (runs.first(), runs.last()) else { return Err(Refusal::InvalidRuns); };
+        if first >= last || runs.iter().any(|&(a,b)| a >= b || b > src.len()) || runs.windows(2).any(|p| p[0].1 > p[1].0) { return Err(Refusal::InvalidRuns); }
+        let (Some(start), Some(end)) = ((dst as usize).checked_add(first), (dst as usize).checked_add(last)) else { return Err(Refusal::AddressOverflow); };
+        if start / PAGE != (end - 1) / PAGE { return Err(Refusal::CrossPage); }
         let p = physical();
-        let Some((&base, (size, slice))) = p.views.range(..=start).next_back() else { return false; };
-        if base.checked_add(*size).is_none_or(|limit| end > limit) { return false; }
+        let Some((&base, (size, slice))) = p.views.range(..=start).next_back() else { return Err(Refusal::NoView); };
+        if base.checked_add(*size).is_none_or(|limit| end > limit) { return Err(Refusal::ViewExtent); }
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        if unsafe { VirtualQuery(start as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0
-            || info.State != MEM_COMMIT || info.Type != MEM_MAPPED || info.Protect != PAGE_READWRITE
-            || info.AllocationBase as usize != base
-            || (info.BaseAddress as usize).checked_add(info.RegionSize).is_none_or(|limit| end > limit) { return false; }
-        let Some(offset) = slice.index.checked_mul(PAGE).and_then(|v| v.checked_add(start - base)) else { return false; };
-        let Some(alias) = slice.section.write_alias.get_or_init(|| ReadAlias::new(&slice.section, true)).as_ref() else { return false; };
-        let Some(target) = alias.checked(offset, end - start) else { return false; };
+        if unsafe { VirtualQuery(start as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 { return Err(Refusal::QueryFailed); }
+        if info.State != MEM_COMMIT { return Err(Refusal::NotCommitted); }
+        if info.Type != MEM_MAPPED { return Err(Refusal::NotMapped); }
+        if info.Protect != PAGE_READWRITE { return Err(Refusal::Protection); }
+        if info.AllocationBase as usize != base { return Err(Refusal::AllocationBase); }
+        if (info.BaseAddress as usize).checked_add(info.RegionSize).is_none_or(|limit| end > limit) { return Err(Refusal::RegionExtent); }
+        let Some(offset) = slice.index.checked_mul(PAGE).and_then(|v| v.checked_add(start - base)) else { return Err(Refusal::SectionOffsetOverflow); };
+        let Some(alias) = slice.section.write_alias.get_or_init(|| ReadAlias::new(&slice.section, true)).as_ref() else { return Err(Refusal::AliasUnavailable); };
+        let Some(target) = alias.checked(offset, end - start) else { return Err(Refusal::AliasExtent); };
         let _active = victory_gpu::physical_write(slice.section.id, offset / PAGE, 1);
         for &(a,b) in runs {
             // SAFETY: the section and its verified alias remain mapped under
@@ -719,7 +722,7 @@ pub unsafe fn write_physical_alias_runs(dst: *mut u8, src: &[u8], runs: &[(usize
                 }
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -1720,25 +1723,45 @@ mod tests {
             let _guard = victory_gpu::begin_kernel_write(at, PAGE, false);
             unsafe { write_physical_alias_runs(at as *mut u8, &src, runs) }
         };
-        assert!(write(a, &runs));
+        assert!(write(a, &runs).is_ok());
         let mut actual = vec![0; PAGE];
         assert!(unsafe { read_physical_alias(actual.as_mut_ptr(), b as *const u8, PAGE) });
         let mut expected = vec![0x31; PAGE];
         for &(lo, hi) in &runs { expected[lo..hi].fill(0x99); }
         assert_eq!(actual, expected);
-        assert!(!write(a + PAGE - 2, &[(0, 1), (3, 4)]));
+        assert_eq!(write(a + PAGE - 2, &[(0, 1), (3, 4)]),
+            Err(victory_gpu::PhysicalWriteRefusal::CrossPage));
         assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 1, pages[1..].as_ptr()) as usize, a);
         unsafe { (a as *mut u8).write_bytes(0x42, PAGE); }
-        assert!(write(a, &runs));
+        assert!(write(a, &runs).is_ok());
         assert_eq!(page_bytes(pages[0]), expected);
         expected.fill(0x42);
         for &(lo, hi) in &runs { expected[lo..hi].fill(0x99); }
         assert_eq!(page_bytes(pages[1]), expected);
         assert!(map_alias(a as u64, 0, PAGE as u64));
-        assert!(!write(a, &runs));
+        assert!(write(a, &runs).is_err());
         assert_eq!(page_bytes(pages[1]), expected);
         assert!(map_alias(b as u64, 0, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn physical_scatter_refusal_reasons_are_exact_and_write_nothing() {
+        use victory_gpu::PhysicalWriteRefusal as R;
+        let source = vec![0x99; PAGE];
+        // These are independent pre-copy failures. In particular a bogus
+        // destination must never be dereferenced just to diagnose its view.
+        let bogus = 1usize as *mut u8;
+        assert_eq!(unsafe { write_physical_alias_runs(bogus, &source, &[]) },
+            Err(R::InvalidRuns));
+        assert_eq!(unsafe { write_physical_alias_runs(bogus, &source, &[(0, 0)]) },
+            Err(R::InvalidRuns));
+        assert_eq!(unsafe { write_physical_alias_runs(bogus, &source, &[(1, 2), (0, 1)]) },
+            Err(R::InvalidRuns));
+        assert_eq!(unsafe { write_physical_alias_runs(bogus, &source, &[(0, 1)]) },
+            Err(R::NoView));
+        assert_eq!(unsafe { write_physical_alias_runs((PAGE-1) as *mut u8, &source, &[(0, 2)]) },
+            Err(R::CrossPage));
     }
 
     #[test]
@@ -1769,7 +1792,7 @@ mod tests {
         for group in &groups {
             let _guard = victory_gpu::begin_kernel_write(dst + group[0].0,
                 group.last().unwrap().1 - group[0].0, false);
-            assert!(unsafe { write_physical_alias_runs(dst as *mut u8, &src, group) });
+            assert!(unsafe { write_physical_alias_runs(dst as *mut u8, &src, group) }.is_ok());
         }
         let mut expected = vec![0x42; 3 * PAGE];
         for (a,b) in runs { expected[a..b].fill(0xD7); }
@@ -1780,10 +1803,10 @@ mod tests {
         unsafe { ((dst + PAGE) as *mut u8).write_bytes(0x88, PAGE); }
         let mid = [(PAGE + 7, PAGE + 11)];
         let _guard = victory_gpu::begin_kernel_write(dst + mid[0].0, 4, false);
-        assert!(unsafe { write_physical_alias_runs(dst as *mut u8, &src, &mid) });
+        assert!(unsafe { write_physical_alias_runs(dst as *mut u8, &src, &mid) }.is_ok());
         assert_eq!(&page_bytes(pages[0])[7..11], &[0xD7;4]);
         assert_eq!(XMemMapPhysicalPages(dst as *mut c_void, 3, std::ptr::null()) as usize, dst);
-        assert!(!unsafe { write_physical_alias_runs(dst as *mut u8, &src, &mid) });
+        assert!(unsafe { write_physical_alias_runs(dst as *mut u8, &src, &mid) }.is_err());
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 

@@ -2091,10 +2091,41 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 
 type PhysicalReader = unsafe fn(*mut u8, *const u8, usize) -> bool;
 static PHYSICAL_READER: OnceLock<PhysicalReader> = OnceLock::new();
-type PhysicalWriter = unsafe fn(*mut u8, &[u8], &[(usize, usize)]) -> bool;
+/// Physical scatter refusals guarantee that no title byte was touched;
+/// the caller retains the original kernel-validated fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PhysicalWriteRefusal {
+    UnsupportedArch,
+    InvalidRuns,
+    AddressOverflow,
+    CrossPage,
+    NoView,
+    ViewExtent,
+    QueryFailed,
+    NotCommitted,
+    NotMapped,
+    Protection,
+    AllocationBase,
+    RegionExtent,
+    SectionOffsetOverflow,
+    AliasUnavailable,
+    AliasExtent,
+}
+#[cfg(feature = "diagnostics")]
+impl PhysicalWriteRefusal {
+    pub(crate) const COUNT: usize = Self::AliasExtent as usize + 1;
+    pub(crate) const NAMES: [&'static str; Self::COUNT] = [
+        "unsupported_arch", "invalid_runs", "address_overflow", "cross_page",
+        "no_view", "view_extent", "query_failed", "not_committed",
+        "not_mapped", "protection", "allocation_base", "region_extent",
+        "section_offset_overflow", "alias_unavailable", "alias_extent",
+    ];
+}
+type PhysicalWriter = unsafe fn(*mut u8, &[u8], &[(usize, usize)]) -> Result<(), PhysicalWriteRefusal>;
 static PHYSICAL_WRITER: OnceLock<PhysicalWriter> = OnceLock::new();
 
-/// Install a physical scatter writer; false must mean no writes occurred.
+/// Install a physical scatter writer; errors must mean no writes occurred.
 pub fn use_physical_writer(writer: PhysicalWriter) {
     let _ = PHYSICAL_WRITER.set(writer);
 }
@@ -2300,35 +2331,88 @@ pub(crate) fn write_mapped_runs(dst: *mut u8, src: &[u8], runs: &[(usize, usize)
     let alias = *ALIAS.get_or_init(|| std::env::var_os("VICTORY_PHYSICAL_WRITE_VIEW").is_some_and(|v| v == "1"));
     let writer = alias.then(|| PHYSICAL_WRITER.get()).flatten();
     let mut written = 0;
+    #[cfg(feature = "diagnostics")]
+    let mut reasons = [0u64; PhysicalWriteRefusal::COUNT + 2];
+    #[cfg(feature = "diagnostics")]
+    let mut successful = (0u64, 0u64, 0u64, 0u64);
+    #[cfg(feature = "diagnostics")]
+    let mut refused = (0u64, 0u64, 0u64, 0u64);
+    #[cfg(feature = "diagnostics")]
+    let mut kernel_stats = (0u64, 0u64, 0u64);
     // Every page has independent all-or-nothing physical certification. If a
     // title remaps one page, only that page uses the validated kernel path;
     // successful preceding pages are never replayed.
     writeback_pages(dst as usize, runs, |group| {
+        #[cfg(feature = "diagnostics")]
+        let bytes = group.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>();
         if let Some(writer) = writer {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
             // SAFETY: independent source, one page, exact changed runs, and
-            // the enclosing title-write guard is held. False writes nothing.
-            if unsafe { writer(dst, src, group) } {
-                let bytes: usize = group.iter().map(|&(a,b)| b-a).sum();
-                written += bytes;
-                #[cfg(feature = "diagnostics")]
-                {
-                    crate::copystat::add(crate::copystat::C::PhysicalWriteBytes, bytes as u64);
-                    crate::copystat::add(crate::copystat::C::PhysicalWriteUs, started.elapsed().as_micros() as u64);
-                    crate::copystat::add(crate::copystat::C::PhysicalWriteRuns, group.len() as u64);
+            // the enclosing title-write guard is held. Err writes nothing.
+            let result = unsafe { writer(dst, src, group) };
+            #[cfg(feature = "diagnostics")]
+            let elapsed_us = started.elapsed().as_micros() as u64;
+            match result {
+                Ok(()) => {
+                    written += group.iter().map(|&(a, b)| b - a).sum::<usize>();
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        successful.0 += 1;
+                        successful.1 += bytes;
+                        successful.2 += group.len() as u64;
+                        successful.3 += elapsed_us;
+                    }
+                    return;
                 }
-                return;
+                Err(reason) => {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        reasons[reason as usize] += 1;
+                        refused.3 += elapsed_us;
+                    }
+                    #[cfg(not(feature = "diagnostics"))]
+                    let _ = reason;
+                }
             }
+        } else {
+            #[cfg(feature = "diagnostics")]
+            { reasons[PhysicalWriteRefusal::COUNT + usize::from(alias)] += 1; }
         }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::BackKernelWriteRuns, group.len() as u64);
+        {
+            refused.0 += 1;
+            refused.1 += bytes;
+            refused.2 += group.len() as u64;
+        }
         #[cfg(feature = "diagnostics")]
         let kernel = std::time::Instant::now();
-        written += group.iter().map(|&(a,b)| write_mapped_open(dst.wrapping_add(a), src[a..b].as_ptr(), b-a)).sum::<usize>();
+        let kernel_bytes = group.iter().map(|&(a,b)| write_mapped_open(dst.wrapping_add(a), src[a..b].as_ptr(), b-a)).sum::<usize>();
+        written += kernel_bytes;
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::BackKernelWriteUs, kernel.elapsed().as_micros() as u64);
+        {
+            kernel_stats.0 += group.len() as u64;
+            kernel_stats.1 += kernel.elapsed().as_micros() as u64;
+            kernel_stats.2 += kernel_bytes as u64;
+        }
     });
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{self, C};
+        copystat::physical_refusals(&reasons);
+        copystat::add(C::PhysicalWriteSucceededGroups, successful.0);
+        copystat::add(C::PhysicalWriteBytes, successful.1);
+        copystat::add(C::PhysicalWriteRuns, successful.2);
+        copystat::add(C::PhysicalWriteUs, successful.3);
+        copystat::add(C::PhysicalWriteRefusedGroups, refused.0);
+        copystat::add(C::PhysicalWriteRefusedBytes, refused.1);
+        copystat::add(C::PhysicalWriteRefusedRuns, refused.2);
+        copystat::add(C::PhysicalWriteRefusedUs, refused.3);
+        copystat::add(C::PhysicalWriteAttemptUs, successful.3 + refused.3);
+        copystat::add(C::BackKernelWriteRuns, kernel_stats.0);
+        copystat::add(C::BackKernelWriteUs, kernel_stats.1);
+        copystat::add(C::BackKernelWriteBytes, kernel_stats.2);
+    }
     written
 }
 
