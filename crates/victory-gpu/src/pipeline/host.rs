@@ -197,6 +197,30 @@ impl GraphicsState {
         )
     }
 
+    /// Exact equality of owned PSO state, ignoring input-name pointer
+    /// addresses and struct padding. Float bits are significant (including
+    /// signed zero and NaN payloads). This is the collision check for live
+    /// pipeline sharing, not a diagnostic hash comparison.
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        let raster = |mut d: D3D12_RASTERIZER_DESC| {
+            let bits = (d.DepthBiasClamp.to_bits(), d.SlopeScaledDepthBias.to_bits());
+            d.DepthBiasClamp = 0.0;
+            d.SlopeScaledDepthBias = 0.0;
+            (d,bits)
+        };
+        self.blend == other.blend && self.sample_mask == other.sample_mask
+            && raster(self.rasterizer) == raster(other.rasterizer) && self.depth == other.depth
+            && self.strip_cut == other.strip_cut && self.topology == other.topology
+            && self.targets == other.targets && self.depth_format == other.depth_format
+            && self.samples == other.samples && self.names == other.names
+            && self.inputs.len() == other.inputs.len()
+            && self.inputs.iter().zip(&other.inputs).all(|(a,b)| {
+                a.SemanticIndex == b.SemanticIndex && a.Format == b.Format && a.InputSlot == b.InputSlot
+                    && a.AlignedByteOffset == b.AlignedByteOffset && a.InputSlotClass == b.InputSlotClass
+                    && a.InstanceDataStepRate == b.InstanceDataStepRate
+            })
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs
@@ -252,18 +276,22 @@ const QUADS: i32 = 32;
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
+    /// The legacy translation selected when packed static CBVs would exceed
+    /// the pipeline's root signature budget, or the device refuses it.
+    fallback: Option<Translated>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    pub(crate) root_uavs: Vec<(u8, u32)>,
 }
 
 impl Stage {
     pub(crate) fn translated(&self) -> &Translated {
-        self.shader
+        self.fallback.as_ref().unwrap_or_else(|| self.shader
             .translated()
-            .expect("host pipelines are made from translated shaders")
+            .expect("host pipelines are made from translated shaders"))
     }
 }
 
@@ -272,6 +300,7 @@ pub(crate) struct HostPipeline {
     pub(crate) compute: bool,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
+    pub(crate) rectangles: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
@@ -305,6 +334,31 @@ fn dxil_wave_lanes(dxil: &[u8]) -> Option<(u32, u32)> {
     Some((min.max(1), if max == 0 { u32::MAX } else { max }))
 }
 
+/// Only a translated mesh shader with a present, valid SFI0 record explicitly
+/// declaring *no DXIL wave operations* may be tested without the original
+/// 64-lane hardware wave. Mesh group/lane identities are lowered from the
+/// flattened group thread ID, and explicit cross-lane mesh operations are
+/// rejected by the shader translator. Missing metadata is never permission.
+fn mesh_without_wave_ops(dxil: &[u8]) -> bool {
+    let Ok(container) = victory_shader::Container::parse(dxil) else {
+        return false;
+    };
+    let Some(part) = container.part(victory_shader::FourCC::SFI0) else {
+        return false;
+    };
+    let Ok(bytes) = <[u8; 8]>::try_from(part.data) else {
+        return false;
+    };
+    // `D3D_SHADER_REQUIRES_WAVE_OPS`, set by shader.rs when lowering emits
+    // any actual DXIL wave operation.
+    u64::from_le_bytes(bytes) & 0x4000 == 0
+}
+
+fn allow_wave_free_mesh() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_FREE_MESH").is_some_and(|v| v == "1"))
+}
+
 /// Whether a translated `stage` program cannot run on a host whose waves have
 /// `host_lanes = (min, max)` lanes.
 ///
@@ -330,13 +384,13 @@ fn wave_lanes_unsupported(
     stage == "mesh" && console_wave64 && host_max < 64
 }
 
-/// Logs a pipeline that gets no host pipeline, once per reason.
+/// Logs a pipeline that gets no host pipeline, once per reason and shader set.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
-    static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(&'static str, Vec<(&'static str, String)>)>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&reason) {
-        seen.push(reason);
-        tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
+    if seen.insert((reason, shaders.iter().map(|s| (s.stage, s.hash.clone())).collect())) {
+        tracing::warn!(?shaders, "no host pipeline: {reason} (once per shader set)");
     }
     None
 }
@@ -345,6 +399,10 @@ impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        Self::new_with_static_cbvs(shaders, g, true)
+    }
+
+    fn new_with_static_cbvs(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, static_cbvs: bool) -> Option<HostPipeline> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -377,22 +435,22 @@ impl HostPipeline {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         let host_lanes = host()?.wave_lanes();
-        if let Some(ms) = mesh
-            && wave_lanes_unsupported(ms.stage, ms.wave64(), None, host_lanes)
-        {
-            return refuse(
-                if host_lanes.1 < 32 {
-                    "a mesh program written for 64-lane waves, on a host without them (e.g. 4-lane WARP)"
-                } else {
-                    "a mesh program written for 64-lane waves, on a host without them"
-                },
-                shaders,
-            );
-        }
         for (s, _) in &stages {
-            let t = s.translated()?;
+            let Some(t) = s.translated() else {
+                return refuse("a required shader failed translation", shaders);
+            };
             let emitted = dxil_wave_lanes(&t.host.dxil);
-            if wave_lanes_unsupported(s.stage, s.wave64(), emitted, host_lanes) {
+            // Optional A/B only: a native wave64 mesh whose DXIL has *no*
+            // wave intrinsics can be evaluated with the same per-lane mesh
+            // program on a 32-lane host. Never make an actual wave64
+            // operation run as two independent wave32 operations.
+            let per_lane_mesh = s.stage == "mesh"
+                && host_lanes.1 >= 32
+                && allow_wave_free_mesh()
+                && mesh_without_wave_ops(&t.host.dxil);
+            if wave_lanes_unsupported(s.stage, s.wave64() && !per_lane_mesh, emitted, host_lanes) {
+                tracing::debug!(shader = ?s, native_wave64 = s.wave64(), ?emitted, ?host_lanes,
+                    no_wave_ops = mesh_without_wave_ops(&t.host.dxil), "wave compatibility gate");
                 return refuse(
                     if host_lanes.1 < 32 {
                         "a shader requiring wider waves than this host supports (e.g. 4-lane WARP)"
@@ -409,15 +467,32 @@ impl HostPipeline {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
+        let mut root_cost = 0usize;
+        let mut optimized = false;
         for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+            let original = shader.translated()?;
+            let fallback = if !static_cbvs && !original.host.static_table_cbvs.is_empty() {
+                let host = match victory_shader::emit::translate(&shader.container) {
+                    Ok(host) => host,
+                    Err(e) => {
+                        tracing::warn!(error = %e, ?shaders, "legacy CBV translation refused");
+                        return None;
+                    }
+                };
+                Some(Translated { host, used: original.used.clone(), sparse_tables: original.sparse_tables.clone() })
+            } else { None };
+            let t = &fallback.as_ref().unwrap_or(original).host;
+            optimized |= !t.static_table_cbvs.is_empty();
             let mut stage = Stage {
                 shader: shader.clone(),
+                fallback: None,
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
             };
             let dwords = t.user_data_dwords();
+            root_cost += dwords as usize + 2 * (t.root_cbvs.len() + t.root_srvs.len() + t.root_uavs.len());
             if dwords > 0 {
                 stage.user_data = Some((params.len() as u32, dwords));
                 params.push(D3D12_ROOT_PARAMETER1 {
@@ -442,6 +517,11 @@ impl HostPipeline {
                     &t.root_srvs,
                     D3D12_ROOT_PARAMETER_TYPE_SRV,
                     &mut stage.root_srvs,
+                ),
+                (
+                    &t.root_uavs,
+                    D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    &mut stage.root_uavs,
                 ),
             ] {
                 for &slot in slots {
@@ -476,17 +556,26 @@ impl HostPipeline {
                     ShaderVisibility: visibility,
                 });
             }
+            stage.fallback = fallback;
             bound.push(stage);
+        }
+        if root_cost > 64 && optimized {
+            tracing::info!(root_cost, ?shaders, "packed static CBVs exceed root budget; using original tables");
+            return Self::new_with_static_cbvs(shaders, g, false);
         }
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
+                if optimized {
+                    tracing::info!(error = %e, ?shaders, "packed static CBV root signature refused; using original tables");
+                    return Self::new_with_static_cbvs(shaders, g, false);
+                }
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
                 return None;
             }
         };
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
+            bound.get(i).map(Stage::translated).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
                     pShaderBytecode: t.host.dxil.as_ptr().cast(),
@@ -512,6 +601,10 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
+                    if optimized {
+                        tracing::info!(error = %e, ?shaders, "packed static CBV compute PSO refused; using original tables");
+                        return Self::new_with_static_cbvs(shaders, g, false);
+                    }
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
                     return None;
@@ -522,6 +615,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                rectangles: false,
                 pso,
                 root,
                 stages: bound,
@@ -544,6 +638,10 @@ impl HostPipeline {
             let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
+                    if optimized {
+                        tracing::info!(error = %e, ?shaders, "packed static CBV mesh PSO refused; using original tables");
+                        return Self::new_with_static_cbvs(shaders, Some(g), false);
+                    }
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
@@ -554,6 +652,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                rectangles: false,
                 pso,
                 root,
                 stages: bound,
@@ -563,11 +662,26 @@ impl HostPipeline {
             });
         }
 
+        let vs = code_bytes(&code(0));
+        let ps = code_bytes(&code(1));
+        let gs = if g.topology.0 == RECTANGLES {
+            match victory_shader::emit::rect_list_gs(&vs, (!ps.is_empty()).then_some(ps.as_slice())) {
+                Ok(gs) => gs,
+                Err(e) => {
+                    tracing::warn!(error = %e, ?shaders, "no rectangle geometry shader");
+                    Vec::new()
+                }
+            }
+        } else { Vec::new() };
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
+            GS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: if gs.is_empty() { std::ptr::null() } else { gs.as_ptr().cast() },
+                BytecodeLength: gs.len(),
+            },
             BlendState: g.blend,
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -592,7 +706,7 @@ impl HostPipeline {
         let name = super::library::name(
             "graphics",
             &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+            &[&vs, &ps, &gs],
             &state,
         );
         let made = super::library::pipeline(
@@ -605,6 +719,10 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
+                if optimized {
+                    tracing::info!(error = %e, ?shaders, "packed static CBV graphics PSO refused; using original tables");
+                    return Self::new_with_static_cbvs(shaders, Some(g), false);
+                }
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
                 return None;
@@ -624,6 +742,7 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
+            rectangles: !gs.is_empty(),
             pso,
             root,
             stages: bound,
@@ -858,6 +977,20 @@ mod tests {
         let _ = offsets(&inputs);
     }
 
+    #[test]
+    fn exact_pipeline_state_comparison_includes_float_bits_and_names() {
+        let mut a = GraphicsState::default();
+        let mut b = GraphicsState::default();
+        assert!(a.same_as(&b));
+        b.rasterizer.DepthBiasClamp = -0.0;
+        assert!(!a.same_as(&b));
+        a.rasterizer.DepthBiasClamp = -0.0;
+        assert!(a.same_as(&b));
+        a.names.push(CString::new("POSITION").unwrap());
+        b.names.push(CString::new("NORMAL").unwrap());
+        assert!(!a.same_as(&b));
+    }
+
     fn synthetic_dxbc_with_psv0(min_lanes: u32, max_lanes: u32) -> Vec<u8> {
         let mut psv = Vec::new();
         psv.extend_from_slice(&48u32.to_le_bytes()); // PSVRuntimeInfo2 size
@@ -947,5 +1080,51 @@ mod tests {
             dxil_wave_lanes(&synthetic_dxbc_with_psv0(32, 32)),
             Some((32, 32))
         );
+    }
+
+    #[test]
+    fn mesh_wave_free_requires_explicit_no_wave_ops_metadata() {
+        assert!(!mesh_without_wave_ops(&[]));
+        assert!(!mesh_without_wave_ops(&synthetic_dxbc_with_psv0(0, u32::MAX)));
+        let make = |flags: u64| {
+            let mut out = Vec::new();
+            out.extend_from_slice(b"DXBC");
+            out.extend_from_slice(&[0u8; 16]);
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&52u32.to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
+            out.extend_from_slice(&36u32.to_le_bytes());
+            out.extend_from_slice(b"SFI0");
+            out.extend_from_slice(&8u32.to_le_bytes());
+            out.extend_from_slice(&flags.to_le_bytes());
+            out
+        };
+        assert!(mesh_without_wave_ops(&make(0)));
+        assert!(mesh_without_wave_ops(&make(0x2000)));
+        assert!(!mesh_without_wave_ops(&make(0x4000)));
+        assert!(!mesh_without_wave_ops(&make(0x6000)));
+    }
+
+    #[test]
+    fn external_top_mesh_wave_feature_audit() {
+        let Some(dir) = std::env::var_os("VICTORY_MESH_DESCRIPTOR_DIR") else {
+            return; // Original game shaders are never committed to the repo.
+        };
+        for hash in [
+            "7972997d15fd9e69",
+            "f5257487f2945fdb",
+            "32c5e0e62380b489",
+            "910b4be059bfb28f",
+        ] {
+            let path = std::path::PathBuf::from(&dir).join(format!("mesh-{hash}.cso"));
+            let Ok(blob) = std::fs::read(&path) else { continue };
+            match victory_shader::emit::translate(&blob) {
+                Ok(shader) => {
+                    let wave_free = mesh_without_wave_ops(&shader.dxil);
+                    eprintln!("native mesh {hash}: wave_free={wave_free}");
+                }
+                Err(err) => eprintln!("native mesh {hash}: not translated: {err}"),
+            }
+        }
     }
 }

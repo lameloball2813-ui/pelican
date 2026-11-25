@@ -13,6 +13,17 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
 
+/// Reserved root SRV slot containing the actual bytes per element of each
+/// buffer descriptor in the view heap. Dynamically selected GFX10 buffer
+/// descriptors carry their own stride, which is not encoded in shader code.
+pub const SLOT_STRIDES: u8 = 255;
+/// Packed, bounds-checked static table CBV data in list-owned upload memory.
+pub const STATIC_CBV_SCRATCH: u8 = 254;
+/// Maximum original descriptor index the translated D3D12 resource heap can
+/// address. Each host heap's stride table is sized to its *actual* count,
+/// stored at dword 0, rather than reserving the maximum in every heap.
+pub const SLOT_STRIDES_COUNT: u32 = 1_000_000;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
@@ -20,6 +31,7 @@ pub(crate) mod flags {
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
+    pub const BARYCENTRICS: u64 = 1 << 22;
     pub const ATOMIC_INT64_ON_TYPED_RESOURCE: u64 = 1 << 27;
     pub const ATOMIC_INT64_ON_DESCRIPTOR_HEAP_RESOURCE: u64 = 1 << 32;
     pub const RESOURCE_HEAP: u64 = 1 << 30;
@@ -57,6 +69,7 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    pub geometry: Option<Geometry>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -67,9 +80,15 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Root UAVs (raw buffers) accessed by the shader.
+    pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Buffer descriptor classes actually emitted in heap annotations:
+    /// bit 0 SRV, bit 1 UAV. Conservative across all reachable handles.
+    pub heap_buffer_classes: u8,
+    heap_buffer_indices: Vec<(u8, V)>,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -79,6 +98,11 @@ pub(crate) struct Shader {
     lds: Option<V>,
     main: V,
     pub entry: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Geometry {
+    pub max_vertices: u32,
 }
 
 impl Shader {
@@ -117,13 +141,17 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            geometry: None,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
+            heap_buffer_classes: 0,
+            heap_buffer_indices: Vec::new(),
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -238,6 +266,24 @@ impl Shader {
         h
     }
 
+    /// Handle for a raw root UAV (`u<slot>` in ROOT_CBV_SPACE).
+    pub fn root_uav_handle(&mut self, slot: u8) -> V {
+        if let Some(&(_, h)) = self.root_uavs.iter().find(|r| r.0 == slot) {
+            return h;
+        }
+        let r = self.m.i32(u32::from(slot));
+        let bind = [r, r, self.m.i32(ROOT_CBV_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(block, "createHandleFromBinding", Attr::ReadNone, self.t.handle, 217,
+            &[bind, r, f]);
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.root_uavs.push((slot, h));
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -297,6 +343,11 @@ impl Shader {
         } else {
             flags::RESOURCE_HEAP
         };
+        if !sampler && matches!(props.0 & 0xff, 10..=12) {
+            let class = if props.0 & 0x1000 != 0 { 2 } else { 1 };
+            self.heap_buffer_classes |= class;
+            self.heap_buffer_indices.push((class, index));
+        }
         self.nonuniform_handles += u32::from(nonuniform);
         let limit = self.m.i32(if sampler { 2048 } else { 1_000_000 });
         let zero = self.m.i32(0);
@@ -314,6 +365,16 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
+    pub(crate) fn heap_demands(&self, user: Option<V>) -> Vec<super::HeapDemand> {
+        let mut demands = Vec::new();
+        for &(class, index) in &self.heap_buffer_indices {
+            let demand = super::HeapDemand { class,
+                code: self.m.heap_index_code(index, user).unwrap_or_default() };
+            if !demands.contains(&demand) { demands.push(demand); }
+        }
+        demands
+    }
+
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
@@ -328,6 +389,7 @@ impl Shader {
             || self.samplers > 0
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
+            || !self.root_uavs.is_empty()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -411,6 +473,27 @@ impl Shader {
                 }
                 srvs = Some(self.m.md_node(list));
             }
+            let mut uavs = None;
+            if !self.root_uavs.is_empty() {
+                let ty = self.m.named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                let no = self.m.bool(false);
+                let no = self.m.md_value(no);
+                let mut list = Vec::new();
+                for (n, (slot, _)) in self.root_uavs.clone().into_iter().enumerate() {
+                    let ops = vec![
+                        Some(i32c(&mut self, n as u32)), Some(self.m.md_value(u)),
+                        Some(empty), Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                        Some(i32c(&mut self, u32::from(slot))), Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)), Some(no), Some(no), Some(no), None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding { kind: 7, space: ROOT_CBV_SPACE,
+                        register: u32::from(slot), dxil_kind: 11 });
+                }
+                uavs = Some(self.m.md_node(list));
+            }
             let mut samplers = None;
             if self.samplers > 0 {
                 let ty = self.m.named_struct("struct.SamplerState", vec![self.t.i32]);
@@ -440,11 +523,12 @@ impl Shader {
                 }
                 samplers = Some(self.m.md_node(list));
             }
-            resources = Some(self.m.md_node(vec![srvs, None, cbvs, samplers]));
-            // PSV0 lists them as the module does: CBVs, samplers, SRVs.
+            resources = Some(self.m.md_node(vec![srvs, uavs, cbvs, samplers]));
+            // PSV0 lists them as the module does: CBVs, samplers, SRVs, UAVs.
             bindings.sort_by_key(|b| match b.kind {
                 2 => 0,
                 1 => 1,
+                7 => 3,
                 _ => 2,
             });
         }
@@ -478,6 +562,7 @@ impl Shader {
                     });
                 }
             }
+            if self.geometry.is_some() { view.extend([0, 0, 0]); }
             let arr = self.m.array(view.len() as u32, self.t.i32);
             let elems: Vec<V> = view.iter().map(|&v| self.m.i32(v)).collect();
             let arr = self.m.aggregate(arr, &elems);
@@ -532,6 +617,11 @@ impl Shader {
                 }
             }
         }
+        if let Some(gs) = self.geometry {
+            props.push(i32c(&mut self, 1));
+            let state = [3, gs.max_vertices, 1, 5, 1].map(|n| Some(i32c(&mut self, n)));
+            props.push(self.m.md_node(state.to_vec()));
+        }
         if let Some(n) = self.wave_size {
             props.push(i32c(&mut self, 11));
             let n = Some(i32c(&mut self, n));
@@ -556,6 +646,7 @@ impl Shader {
         // Program kinds: 0 pixel, 1 vertex, 5 compute, 13 mesh.
         let (name, kind) = match (self.threads, self.pixel) {
             _ if self.mesh.is_some() => ("ms", 13u32),
+            _ if self.geometry.is_some() => ("gs", 2u32),
             (Some(_), _) => ("cs", 5u32),
             (None, true) => ("ps", 0),
             (None, false) => ("vs", 1),
@@ -588,6 +679,9 @@ impl Shader {
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
         }
+        if self.flags & flags::BARYCENTRICS != 0 {
+            features |= 0x2_0000;
+        }
         if self.flags & flags::ATOMIC_INT64_ON_TYPED_RESOURCE != 0 {
             features |= 0x40_0000;
         }
@@ -615,6 +709,7 @@ impl Shader {
             outputs: &self.outputs,
             prims: &self.prims,
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
+            gs: self.geometry.map(|g| g.max_vertices),
             bindings: &bindings,
             threads: self.threads.unwrap_or_default(),
             wave_size: self.wave_size,

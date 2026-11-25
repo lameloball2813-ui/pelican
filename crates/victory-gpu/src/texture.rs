@@ -47,13 +47,64 @@ pub(crate) struct Staging {
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
-/// (memory not watched), or the write-watch asking it was detiled after,
-/// with room to read the memory into.
+/// (memory not watched), or the write-watch asking it was detiled after.
+/// The CPU tiled read buffer is temporary: retaining one per texture
+/// duplicated potentially gigabytes of already committed title data.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
     asked: u64,
-    read: Vec<u8>,
+}
+
+/// A small bounded pool of temporary CPU-side texture reads. The persistent
+/// GPU upload resource is still owned by each Staging; only scratch used
+/// while hashing/detiling is shared, never the resulting texture pixels.
+static READ_SCRATCH: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+const MAX_READ_SCRATCH_BYTES: usize = 128 << 20;
+const MAX_READ_SCRATCH_BUFFERS: usize = 4;
+
+struct ReadScratch(Vec<u8>);
+
+impl ReadScratch {
+    fn new(size: usize) -> Self {
+        let mut pool = READ_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let found = pool.iter().enumerate()
+            .filter(|(_, v)| v.capacity() >= size)
+            .min_by_key(|(_, v)| v.capacity())
+            .map(|(i, _)| i);
+        let mut bytes = found.map_or_else(|| Vec::with_capacity(size), |i| pool.swap_remove(i));
+        drop(pool);
+        bytes.resize(size, 0);
+        Self(bytes)
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static LIVE_STAGING_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Staging {
+    fn drop(&mut self) {
+        LIVE_STAGING_BYTES.fetch_sub(self.size, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn staging_bytes() -> u64 {
+    LIVE_STAGING_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+impl Drop for ReadScratch {
+    fn drop(&mut self) {
+        let bytes = std::mem::take(&mut self.0);
+        if bytes.capacity() > MAX_READ_SCRATCH_BYTES { return; }
+        let mut pool = READ_SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let retained: usize = pool.iter().map(Vec::capacity).sum();
+        if pool.len() < MAX_READ_SCRATCH_BUFFERS
+            && retained.saturating_add(bytes.capacity()) <= MAX_READ_SCRATCH_BYTES {
+            pool.push(bytes);
+        }
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -207,15 +258,15 @@ impl Staging {
             last.asked = now;
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
-            last.read.resize(size, 0);
-            crate::host::copy_mapped(last.read.as_mut_ptr(), self.memory, size, false);
-            self.detile(&last.read);
+            let mut read = ReadScratch::new(size);
+            crate::host::copy_mapped(read.0.as_mut_ptr(), self.memory, size, false);
+            self.detile(&read.0);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
             return size;
         }
-        last.read.resize(size, 0);
-        match read_resident(self.memory, &mut last.read) {
+        let mut read = ReadScratch::new(size);
+        match read_resident(self.memory, &mut read.0) {
             Residency::Unmapped => {
                 last.hash = None;
                 #[cfg(feature = "diagnostics")]
@@ -228,28 +279,28 @@ impl Staging {
                 0
             }
             Residency::Full => {
-                let hash = blake3::hash(&last.read);
+                let hash = blake3::hash(&read.0);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
                     return size;
                 }
                 last.hash = Some(hash);
-                self.detile(&last.read);
+                self.detile(&read.0);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
             }
             Residency::Partial(intervals) => {
-                let (hash, resident_bytes) = hash_intervals(&last.read, &intervals);
+                let (hash, resident_bytes) = hash_intervals(&read.0, &intervals);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, resident_bytes as u64);
                 if last.hash == Some(hash) {
                     return resident_bytes;
                 }
-                zero_gaps(&mut last.read, &intervals);
+                zero_gaps(&mut read.0, &intervals);
                 last.hash = Some(hash);
-                self.detile(&last.read);
+                self.detile(&read.0);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, resident_bytes as u64);
                 resident_bytes
@@ -470,6 +521,14 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         );
     }
     let (buffer, data) = host.upload_buffer(total)?;
+    #[cfg(feature = "diagnostics")]
+    {
+        let old = LIVE_STAGING_BYTES.fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+        let live = old + total;
+        if live >> 28 != old >> 28 {
+            tracing::info!(live_bytes = live, "live texture upload staging bytes");
+        }
+    }
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -587,9 +646,14 @@ mod tests {
         const TILE: usize = 64 * 1024;
         const TOTAL: usize = 256 * 1024;
         let region = VirtualRegion::reserve(TOTAL);
-        let mut dst = vec![0xAAu8; TOTAL];
+        // Poison a pooled buffer as though it had previously held a
+        // completely different texture. All mapped intervals must replace
+        // the bytes, and gaps must be cleared before detiling.
+        let mut scratch = ReadScratch::new(TOTAL);
+        scratch.0.fill(0xAA);
+        let dst = &mut scratch.0;
 
-        assert_eq!(read_resident(region.ptr, &mut dst), Residency::Unmapped);
+        assert_eq!(read_resident(region.ptr, dst), Residency::Unmapped);
 
         region.commit(0, TILE);
         let tile0: Vec<u8> = (0..TILE)
@@ -599,7 +663,7 @@ mod tests {
         unsafe { region.write_slice(0, &tile0) };
 
         assert_eq!(
-            read_resident(region.ptr, &mut dst),
+            read_resident(region.ptr, dst),
             Residency::Partial(vec![(0, TILE)])
         );
         assert_eq!(dst[..TILE], tile0[..]);
@@ -609,7 +673,7 @@ mod tests {
         // Mutating unmapped tail bytes in `dst` must not affect the resident hash.
         dst[TILE..].fill(0x55);
         assert_eq!(
-            read_resident(region.ptr, &mut dst),
+            read_resident(region.ptr, dst),
             Residency::Partial(vec![(0, TILE)])
         );
         let (hash0_repeat, bytes0_repeat) = hash_intervals(&dst, &[(0, TILE)]);
@@ -623,7 +687,7 @@ mod tests {
         // SAFETY: `[2 * TILE..3 * TILE)` was committed above.
         unsafe { region.write_slice(2 * TILE, &tile2) };
 
-        let res = read_resident(region.ptr, &mut dst);
+        let res = read_resident(region.ptr, dst);
         assert_eq!(
             res,
             Residency::Partial(vec![(0, TILE), (2 * TILE, 3 * TILE)])
@@ -637,21 +701,21 @@ mod tests {
         // Decommit the second tile while leaving junk across unmapped gaps; `zero_gaps` must clear it.
         region.decommit(2 * TILE, TILE);
         dst[TILE..].fill(0xCC);
-        let res_after_evict = read_resident(region.ptr, &mut dst);
+        let res_after_evict = read_resident(region.ptr, dst);
         assert_eq!(res_after_evict, Residency::Partial(vec![(0, TILE)]));
         let Residency::Partial(intervals) = res_after_evict else {
             unreachable!();
         };
         let (hash_after_evict, bytes_after_evict) = hash_intervals(&dst, &intervals);
         assert_eq!((hash_after_evict, bytes_after_evict), (hash0, TILE));
-        zero_gaps(&mut dst, &intervals);
+        zero_gaps(dst, &intervals);
         assert_eq!(dst[..TILE], tile0[..]);
         assert!(dst[TILE..].iter().all(|&b| b == 0));
 
         // Committing the remaining gaps yields `Residency::Full`.
         region.commit(TILE, TILE);
         region.commit(2 * TILE, 2 * TILE);
-        assert_eq!(read_resident(region.ptr, &mut dst), Residency::Full);
+        assert_eq!(read_resident(region.ptr, dst), Residency::Full);
     }
 
     fn readback_mip(

@@ -84,6 +84,8 @@ mod diff_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod rect;
+pub use rect::rect_list_gs;
 mod sampler;
 mod shader;
 #[cfg(windows)]
@@ -93,13 +95,19 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
+#[cfg(all(test, windows))]
+mod bvh_scan_tests;
+#[cfg(all(test, windows))]
+mod prison_wave64_tests;
+#[cfg(all(test, windows))]
+mod root_uav_original_tests;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_STRIDES, SLOT_STRIDES_COUNT, STATIC_CBV_SCRATCH, USER_DATA_SPACE};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -139,6 +147,55 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
     }
 }
 
+/// Exact expression for a heap buffer handle, evaluated from the very same
+/// root dwords passed to the translated shader. Empty code means unknown:
+/// the host must prepare the entire descriptor class in that case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeapDemand {
+    pub class: u8,
+    /// Postfix pairs (opcode, argument), limited to 24 nodes. The arithmetic
+    /// is LLVM i32 arithmetic, not native-sized host arithmetic.
+    pub code: Vec<u32>,
+}
+
+impl HeapDemand {
+    pub fn slot(&self, user: &[u32]) -> Option<u32> {
+        if self.code.is_empty() || self.code.len() > 48 || self.code.len() % 2 != 0 {
+            return None;
+        }
+        let mut stack = [0u32; 24];
+        let mut n = 0;
+        for op in self.code.chunks_exact(2) {
+            let result = match op[0] {
+                0 => op[1],
+                1 => *user.get(op[1] as usize)?,
+                k => {
+                    if n < 2 || op[1] != 0 { return None; }
+                    let (a,b) = (stack[n-2], stack[n-1]);
+                    n -= 2;
+                    match k {
+                        2 => a.wrapping_add(b),
+                        3 => a.wrapping_sub(b),
+                        4 => a.wrapping_mul(b),
+                        5 => a.checked_shl(b)?,
+                        6 => a.checked_shr(b)?,
+                        7 => a & b,
+                        8 => a | b,
+                        9 => a ^ b,
+                        _ => return None,
+                    }
+                }
+            };
+            stack[n] = result;
+            n += 1;
+        }
+        if n != 1 { return None; }
+        // Match Shader::heap_handle's actual clamp, including its slot-zero
+        // fallback. Host heap bounds are checked separately by the caller.
+        Some(if stack[0] < 1_000_000 { stack[0] } else { 0 })
+    }
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
@@ -158,6 +215,21 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// Root UAV raw buffer views used by this shader.
+    pub root_uavs: Vec<u8>,
+    /// Ordered static CBVs removed from the shader's descriptor tables.
+    /// Root SRV STATIC_CBV_SCRATCH contains (byte offset, exact byte size)
+    /// pairs, a zero dword at byte 8*N, then aligned constant data.
+    pub static_table_cbvs: Vec<StaticTableCbv>,
+    /// Emitted heap buffer handle classes: bit 0 SRV, bit 1 UAV.
+    pub heap_buffer_classes: u8,
+    pub heap_demands: Vec<HeapDemand>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StaticTableCbv {
+    pub slot: u8,
+    pub table_offset_dwords: u32,
 }
 
 impl HostShader {
@@ -190,6 +262,16 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_with_static_cbvs(container, false)
+}
+
+/// Runtime variant: static CBVs use the packed root SRV ABI where proven.
+/// The legacy translation remains available for root-signature budget fallback.
+pub fn translate_static_cbvs(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_with_static_cbvs(container, true)
+}
+
+fn translate_with_static_cbvs(container: &[u8], static_cbvs: bool) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -206,14 +288,21 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
-    let st = structure::structure(&p);
+    let (mut p, mut st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    // Xbox compute shaders with spilled root arguments hold a pointer to the
+    // user-data table in s0:s1, not a descriptor/root parameter. Rewrite
+    // proven table loads into the corresponding declared root dwords before
+    // resource provenance; otherwise these real BVH-building passes fail at
+    // their first scalar load. Keep all unproven loads as native operations.
+    if crate::spill::is_spilled(&native) && crate::spill::user_data(&mut p, &native) != 0 {
+        st = crate::structure::structure(&p);
+    }
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_with_static_cbvs(&c, &native, &p, &st, &io, &res, static_cbvs)
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -224,6 +313,18 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_with_static_cbvs(c, native, p, st, io, res, false)
+}
+
+fn emit_with_static_cbvs(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    static_cbvs: bool,
 ) -> Result<HostShader, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
@@ -280,7 +381,7 @@ pub fn emit(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let l = lower::lower_with_static_cbvs(&lower::Parts {
         native,
         p,
         st,
@@ -290,7 +391,7 @@ pub fn emit(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    }, static_cbvs)?;
     Ok(HostShader {
         stage: native.stage,
         dxil: l.dxil,
@@ -310,6 +411,10 @@ pub fn emit(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        static_table_cbvs: l.static_table_cbvs,
+        heap_buffer_classes: l.heap_buffer_classes,
+        heap_demands: l.heap_demands,
     })
 }
 
@@ -360,6 +465,7 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
             68 => 18,
             69 => 20,
             70 => 15,
+            23 => 28, // barycentrics
             25 => 30, // cull primitive
             _ => {
                 return Err(ShaderError::Unsupported {
@@ -667,6 +773,10 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            static_table_cbvs: Vec::new(),
+            heap_buffer_classes: 0,
+            heap_demands: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -677,6 +787,10 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                static_table_cbvs: Vec::new(),
+                heap_buffer_classes: 3,
+                heap_demands: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -792,6 +906,64 @@ mod tests {
         assert_eq!(center[4 + 1], 0, "center interpolation is per pixel");
         let sample = psv_of(1 << 0);
         assert_eq!(sample[4 + 1], 1, "PSInfo.SampleFrequency");
+    }
+
+    #[test]
+    fn native_barycentric_values_use_unpacked_signature() {
+        let program = |direct: bool| {
+            let words = if direct {
+                vec![0x0604_0300u32] // v_add_f32 v2, v0, v1
+            } else {
+                vec![0xC808_0000, 0xC809_0001] // paired interpolation
+            };
+            let words = words.into_iter().chain([0xF800_180F, 0x0202_0202, 0xBF81_0000]);
+            let native = super::NativeProgram {
+                stage: super::HwStage::Ps, wave64: false, vgprs: 4,
+                layout: vec![], used: vec![],
+                io: crate::native::StageIo::Ps {
+                    inputs: vec![crate::native::PsInput {
+                        usage: crate::native::Usage::Generic, row: 0, mask: 15,
+                        attr: 0, flat: false, fp16: false, pack2: false, row2: 0,
+                    }],
+                    input_addr: 1 << 1, db_shader_control: 0, patches: vec![],
+                },
+                code: words.flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let el = |name: &str, kind, usage| SigElement {
+                name: name.into(), index: 0, kind, comp: 9, interp: 0,
+                row: Some(0), col: 0, cols: 4, usage, half: false,
+            };
+            let isg = super::container::signature(&[el("TEXCOORD",0,0)], true);
+            let osg = super::container::signature(&[el("SV_Target",16,15)], false);
+            let bytes = crate::dxbc::build(&[(super::FourCC::ISG1,&isg),(super::FourCC::OSG1,&osg)]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(),native.wave64,native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p,&native.layout,native.stage,Some(&st)).unwrap();
+            let io = crate::io::raise(&p,&native).unwrap();
+            let shader = super::emit(&c,&native,&p,&st,&io,&res).unwrap();
+            #[cfg(windows)]
+            if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+                v.validate(&mut shader.dxil.clone()).unwrap();
+            }
+            let c = super::Container::parse(&shader.dxil).unwrap();
+            let features = u64::from_le_bytes(c.part(super::FourCC::SFI0).unwrap().data[..8].try_into().unwrap());
+            let sig = c.part(super::FourCC::ISG1).unwrap().data;
+            let elements = super::signature(sig).unwrap();
+            let bary = elements.iter().find(|e| e.kind == 28);
+            assert_eq!(features & 0x2_0000 != 0, direct);
+            assert_eq!(bary.is_some(), direct);
+            if let Some(e) = bary {
+                assert_eq!((e.row,e.col,e.cols),(None,0,3));
+                let count = u32::from_le_bytes(sig[..4].try_into().unwrap()) as usize;
+                assert!((0..count).any(|i| {
+                    let at = 8+32*i;
+                    u32::from_le_bytes(sig[at+12..at+16].try_into().unwrap()) == 23 && sig[at+25] == 6
+                }));
+            }
+        };
+        program(true);
+        program(false);
     }
 
     /// A pixel shader reading channel z of an input whose element starts at

@@ -70,7 +70,10 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        victory_shader::emit::translate_static_cbvs(c)
+            .or_else(|_| victory_shader::emit::translate(c)).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
@@ -131,7 +134,9 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+// A root-UAV list was added to the HostShader cache format. Refuse old
+// entries instead of decoding their subsequent fields at wrong offsets.
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -206,9 +211,21 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs] {
+    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
+    }
+    word(&mut out, s.static_table_cbvs.len() as u32);
+    for cbv in &s.static_table_cbvs {
+        word(&mut out, u32::from(cbv.slot));
+        word(&mut out, cbv.table_offset_dwords);
+    }
+    out.push(s.heap_buffer_classes);
+    word(&mut out, s.heap_demands.len() as u32);
+    for demand in &s.heap_demands {
+        out.push(demand.class);
+        word(&mut out, demand.code.len() as u32);
+        for &op in &demand.code { word(&mut out, op); }
     }
     out
 }
@@ -266,6 +283,32 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
+    let root_uavs = r.list()?;
+    let n = r.word()? as usize;
+    if n > 256 { return None; }
+    let mut static_table_cbvs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let cbv = victory_shader::emit::StaticTableCbv {
+            slot: u8::try_from(r.word()?).ok()?,
+            table_offset_dwords: r.word()?,
+        };
+        if cbv.table_offset_dwords % 8 != 0 || static_table_cbvs.last().is_some_and(|old| *old >= cbv) { return None; }
+        static_table_cbvs.push(cbv);
+    }
+    if !static_table_cbvs.is_empty() && !root_srvs.contains(&victory_shader::emit::STATIC_CBV_SCRATCH) { return None; }
+    let heap_buffer_classes = *r.take(1)?.first()?;
+    if heap_buffer_classes > 3 { return None; }
+    let n = r.word()? as usize;
+    let mut heap_demands = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        let class = *r.take(1)?.first()?;
+        if !matches!(class, 1 | 2) || heap_buffer_classes & class == 0 { return None; }
+        let len = r.word()? as usize;
+        if len > 48 || len % 2 != 0 { return None; }
+        let mut code = Vec::with_capacity(len);
+        for _ in 0..len { code.push(r.word()?); }
+        heap_demands.push(victory_shader::emit::HeapDemand { class, code });
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -274,6 +317,10 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         static_samplers,
         root_cbvs,
         root_srvs,
+        root_uavs,
+        static_table_cbvs,
+        heap_buffer_classes,
+        heap_demands,
     })
 }
 
@@ -299,7 +346,11 @@ mod tests {
                 0,
             ])],
             root_cbvs: vec![2],
-            root_srvs: vec![0, 3],
+            root_srvs: vec![0, 3, victory_shader::emit::STATIC_CBV_SCRATCH],
+            root_uavs: vec![4],
+            static_table_cbvs: vec![victory_shader::emit::StaticTableCbv { slot: 1, table_offset_dwords: 8 }],
+            heap_buffer_classes: 1,
+            heap_demands: vec![victory_shader::emit::HeapDemand { class: 1, code: vec![1, 8, 0, 5, 6, 0] }],
         }
     }
 

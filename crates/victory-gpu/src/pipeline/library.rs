@@ -57,6 +57,11 @@ fn library() -> Option<&'static Mutex<Library>> {
     static LIBRARY: OnceLock<Option<Mutex<Library>>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
+            #[cfg(feature = "diagnostics")]
+            if crate::switch::on("VICTORY_NO_PIPELINE_LIBRARY") {
+                tracing::info!("host pipeline library bypassed for memory A/B");
+                return None;
+            }
             let device = crate::host::host()?.device.cast::<ID3D12Device1>().ok()?;
             let blob = DIR
                 .get()

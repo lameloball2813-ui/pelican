@@ -128,6 +128,10 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_valu_cs_vgprs(body, 8)
+}
+
+fn build_valu_cs_vgprs(body: &[u32], vgprs: u16) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -140,18 +144,30 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
-    build_cs(&words, 1)
+    build_cs_group_vgprs(&words, [1, 1, 1], false, 0, false, vgprs)
 }
 
 /// Lowers a synthetic RDNA2 compute shader of `threads` threads in one row
 /// (thread id in `v0`): 4 dwords of root constants in `s0..s3`, the
 /// descriptor table address in `s4`, a raw UAV at heap index 0.
 fn build_cs(words: &[u32], threads: u32) -> HostShader {
+    build_cs_config(words, threads, false, 0, false)
+}
+
+fn build_cs_config(words: &[u32], threads: u32, wave64: bool, lds_bytes: u32, expect_allocation: bool) -> HostShader {
+    build_cs_group(words, [threads, 1, 1], wave64, lds_bytes, expect_allocation)
+}
+
+fn build_cs_group(words: &[u32], threads: [u32; 3], wave64: bool, lds_bytes: u32, expect_allocation: bool) -> HostShader {
+    build_cs_group_vgprs(words, threads, wave64, lds_bytes, expect_allocation, 8)
+}
+
+fn build_cs_group_vgprs(words: &[u32], threads: [u32; 3], wave64: bool, lds_bytes: u32, expect_allocation: bool, vgprs: u16) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 8,
+        wave64,
+        vgprs,
         layout: vec![
             RootParam {
                 root: RootType::Constants,
@@ -181,19 +197,28 @@ fn build_cs(words: &[u32], threads: u32) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [threads, 1, 1],
+            rsrc2: (5 << 1) | ((lds_bytes / 512) << 15)
+                | (if threads[2] > 1 { 2 } else if threads[1] > 1 { 1 } else { 0 }) << 11,
+            threads,
         }),
         code,
     };
 
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
+    lower_native_cs(&native, expect_allocation)
+}
+
+fn lower_native_cs(native: &NativeProgram, expect_allocation: bool) -> HostShader {
+    lower_native_cs_options(native, expect_allocation, false)
+}
+
+fn lower_native_cs_options(native: &NativeProgram, expect_allocation: bool, static_cbvs: bool) -> HostShader {
+    let (p, st) = crate::range::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = st.expect("structure");
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
+    let io = io::raise(&p, native).expect("io::raise");
+    let parts = lower::Parts {
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -202,8 +227,16 @@ fn build_cs(words: &[u32], threads: u32) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
-    .expect("lower");
+    };
+    if expect_allocation {
+        assert!(lower::lds_allocation_audit(&parts).is_some(), "allocator certificate rejected synthetic shader");
+    }
+    let lowered = lower::lower_with_static_cbvs(&parts, static_cbvs).expect("lower");
+    if expect_allocation {
+        assert!(!lowered.wave_ops);
+        let barriers = lowered.insts.iter().filter(|i| i.contains("k80,")).count();
+        assert_eq!(barriers, 3);
+    }
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -213,6 +246,10 @@ fn build_cs(words: &[u32], threads: u32) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        static_table_cbvs: lowered.static_table_cbvs,
+        heap_buffer_classes: lowered.heap_buffer_classes,
+        heap_demands: lowered.heap_demands,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -223,6 +260,280 @@ fn build_cs(words: &[u32], threads: u32) -> HostShader {
     }
 
     shader
+}
+
+#[test]
+fn static_table_cbv_packed_numerical() {
+    // Two exact static CBVs and an ordinary raw UAV in the same table.
+    let mut w = vec![s_mov_b32(5,128)];
+    for (reg, offset) in [(8,0),(12,32),(16,64)] {
+        let mut load = s_load_dwordx4(reg,4);
+        load[1] |= offset;
+        w.extend(load);
+    }
+    // Scalar x4 crosses the first CBV's boundary; second CBV uses a
+    // dynamic scalar address and a two-dword per-thread vector read.
+    w.extend([0xF4280504, 0xFA00000C]); // s[20:23] from s[8:11]+12
+    w.extend([0xF4200606, 0x00000000]); // s24 from s[12:15]+s0
+    w.push(vop2(0x1A,1,130,0)); // v1=tid*4
+    w.extend([0xE0341000,0x80030201]); // buffer_load_dwordx2 v[2:3],v1,s[12:15],0 offen
+    w.push(vop2(0x1A,4,133,0)); // v4=tid*32
+    for k in 0..7u8 {
+        let data = if k < 5 { w.push(vop1(1,5,sgpr(20+k))); 5 } else { k-3 };
+        let mut store = buffer_store_dword_offen(data,4,16);
+        store[0] |= u32::from(k)*4;
+        w.extend(store);
+    }
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs, wave64: false, vgprs: 8,
+        layout: vec![
+            RootParam { root: RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
+            RootParam { root: RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 1 },
+        ],
+        used: [ResourceType::Cbv, ResourceType::Cbv, ResourceType::Uav].into_iter().enumerate().map(|(k,kind)| UsedResource {
+            kind, root: RootType::Table, table_offset_dwords: 8*k as u32, lower_bound: 0,
+            stride: 0, dwords: 4, user_data: 4, slot: 1,
+        }).collect(),
+        io: StageIo::Cs(ComputeIo { rsrc2: 5<<1, threads: [8,1,1] }),
+        code: w.iter().flat_map(|word| word.to_le_bytes()).collect(),
+    };
+    let shader = lower_native_cs_options(&native,false,true);
+    assert_eq!(shader.static_table_cbvs, [super::StaticTableCbv {slot:1,table_offset_dwords:0}, super::StaticTableCbv {slot:1,table_offset_dwords:8}]);
+    assert_eq!(shader.root_srvs, [super::STATIC_CBV_SCRATCH]);
+    assert!(lower_native_cs(&native,false).static_table_cbvs.is_empty());
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware",false),("warp",true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root,pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let data = [0x7fc12345,0x80000000,0x7fa65432,123,456,789,987,0xffffffff];
+        for (offset, null) in [(0,false),(28,false),(32,false),(u32::MAX,false),(0,true)] {
+            let mut packed = vec![0xBADBADu32;192];
+            packed[..5].copy_from_slice(&[256,16,if null {16} else {512},if null {0} else {32},0]);
+            packed[64..68].copy_from_slice(&[11,22,33,44]);
+            packed[128..136].copy_from_slice(&data);
+            let mut ud = vec![0u32;shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = if u.root == RootType::Constants && u.dword == 0 {offset} else {0};
+            }
+            let result = host.dispatch(&root,&pso,&Dispatch {
+                roots:vec![(0,Root::Constants(ud)),(1,Root::View {srv:true,data:packed})],
+                // Heap CBV slots contain unrelated bytes; the optimized
+                // shader must never read them, nor move the retained UAV.
+                views:&[View::Cbv(&[999;4]),View::Cbv(&[888;4]),View::RawUav(64)],samplers:&[],groups:[1,1,1],
+            }).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let scalar = if null {0} else {data.get((offset/4) as usize).copied().unwrap_or(0)};
+            for lane in 0..8 {
+                let first = if null {0} else {data[lane]};
+                let second = if null {0} else {data.get(lane+1).copied().unwrap_or(0)};
+                assert_eq!(&result[0][lane*8..lane*8+8],&[44,0,0,0,scalar,first,second,0],"{label} lane={lane} offset={offset} null={null}");
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran>0);
+}
+
+/// The native 8x8 filter's two center planes, four-column halo, and
+/// two-iteration symmetric six-pair LDS consumer. Integer data keeps the
+/// expected answer exact; the native filter's address proof is exercised.
+#[test]
+fn certified_filter_lds_numerical() {
+    let mut w = vec![s_mov_b32(10, 4), s_mov_b32(11, 128)];
+    // s[8:15] is the output 2D UAV descriptor, s5/s6 are group X/Y.
+    w.extend([0xF40C0205, 0xFA000000]);
+    w.extend(vop3(0x346, 2, sgpr(5), 131, vgpr(0)));
+    w.extend(vop3(0x346, 3, sgpr(6), 131, vgpr(1)));
+    // Cell t=8*x+y, pair values t+1 and 2*(t+1).
+    w.extend(vop3(0x346, 4, vgpr(0), 131, vgpr(1)));
+    w.push(vop2(0x1A, 5, 131, 4)); // byte offset 8*t
+    w.push(vop2(0x25, 6, 129, 4));
+    w.push(vop2(0x1A, 7, 129, 6));
+    w.extend([0xD8380100, 0x00070605]); // write2 v5, v6, v7 offsets 0/1
+    w.push(vop2(0x25, 6, 192, 6)); // +64
+    w.push(vop2(0x1A, 7, 129, 6));
+    w.extend([0xD8388180, 0x00070605]); // t+64
+    w.extend([0xBE90047E, 0x7D280084]); // save EXEC, cmpx 4 > v0
+    let skip = w.len(); w.push(0);
+    w.push(vop2(0x25, 4, 192, 4));
+    w.push(vop2(0x1A, 5, 131, 4));
+    w.push(vop2(0x25, 6, 192, 6));
+    w.push(vop2(0x1A, 7, 129, 6));
+    w.extend([0xD8388180, 0x00070605]); // t+128 for x < 4
+    let join = w.len();
+    w.push(0xBEFE0410); // restore full EXEC
+    w.push(vop2(0x25, 8, 134, 0)); // center x+6
+    // Read center and initialize the two independent accumulators.
+    w.extend(vop3(0x346, 9, vgpr(8), 131, vgpr(1)));
+    w.push(vop2(0x1A, 9, 131, 9));
+    w.extend([0xD8DC0100, 0x14000009]); // read2 v[20:21], v9
+    w.push(s_mov_b32(0, 129));
+    let loop_head = w.len();
+    // Each scalar iteration reads center ±(s0, s0+1, s0+2).
+    for delta in 0..3u8 {
+        w.push(sop2(2, 1, 0, 128 + delta)); // s_add_i32 s1,s0,delta
+        w.push(sop2(3, 7, 128, 1)); // s_sub_i32 s7,0,s1
+        for offset in [1u8, 7] {
+            w.push(vop2(0x25, 9, sgpr(offset), 8));
+            w.extend(vop3(0x346, 9, vgpr(9), 131, vgpr(1)));
+            w.push(vop2(0x1A, 9, 131, 9));
+            w.extend([0xD8DC0100, 0x12000009]); // read2 v[18:19],v9
+            w.push(vop2(0x25, 20, vgpr(18), 20));
+            w.push(vop2(0x25, 21, vgpr(19), 21));
+        }
+    }
+    w.extend([sop2(2, 0, 0, 131), 0xBF068700]); // s0+=3; s0==7
+    let again = w.len(); w.push(0);
+    w.extend([vop1(6, 20, vgpr(20)), vop1(6, 21, vgpr(21)),
+        vop1(1, 22, 128), vop1(1, 23, 128)]); // float results, zero sentinels
+    w.extend([0xF0201F08, 0x00021402]); // image_store v[20:23],v[2:3],s[8:15]
+    w.push(S_ENDPGM);
+    w[skip] = 0xBF880000 | ((join as isize - skip as isize - 1) as i16 as u16 as u32);
+    w[again] = 0xBF840000 | ((loop_head as isize - again as isize - 1) as i16 as u16 as u32);
+    let native = NativeProgram {
+        stage: HwStage::Cs, wave64: true, vgprs: 32,
+        layout: vec![
+            RootParam { root: RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
+            RootParam { root: RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 1 },
+        ],
+        used: vec![UsedResource { kind: ResourceType::Uav, root: RootType::Table, table_offset_dwords: 0,
+            lower_bound: 0, stride: 0, dwords: 8, user_data: 4, slot: 1 }],
+        io: StageIo::Cs(ComputeIo { rsrc2: (5 << 1) | (3 << 15) | (1 << 11) | (1 << 7) | (1 << 8), threads: [8,8,1] }),
+        code: w.iter().flat_map(|word| word.to_le_bytes()).collect(),
+    };
+    let shader = lower_native_cs(&native, false);
+    let c = crate::dxbc::Container::parse(&shader.dxil).unwrap();
+    let psv = c.part(crate::dxbc::FourCC::PSV0).unwrap().data;
+    assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()), u32::MAX);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root,pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let ud = vec![0u32; shader.user_data_dwords() as usize];
+        let result = host.dispatch(&root,&pso,&Dispatch {
+            roots: vec![(0,Root::Constants(ud))], views: &[View::TextureUav(16,16)],
+            samplers: &[], groups: [2,2,1],
+        }).unwrap_or_else(|e| panic!("{label}: {e}"));
+        for y in 0..16 { for x in 0..16 {
+            let sum = (0..13).map(|k| 8 * ((x % 8) + k) + y % 8 + 1).sum::<usize>();
+            let at = 4*(y*16+x);
+            assert_eq!(&result[0][at..at+4], &[(sum as f32).to_bits(), (2.0*sum as f32).to_bits(),0,0], "{label} {x},{y}");
+        } }
+        ran += 1;
+    }
+    assert!(ran > 0);
+}
+
+/// The f8 count/allocate/publish protocol with one 64-lane native wave,
+/// including a path that reaches the existing iteration cap. A raw UAV
+/// substitutes for the original structured counter and particle records.
+#[test]
+fn certified_lds_allocation_numerical_and_cap() {
+    fn branch(words: &mut [u32], at: usize, target: usize, opcode: u32) {
+        words[at] = opcode | ((target as isize - at as isize - 1) as i16 as u16 as u32);
+    }
+    let mut w = vec![
+        s_mov_b32(5,128),
+        s_load_dwordx4(8,4)[0], s_load_dwordx4(8,4)[1],
+        vop1(1,1,vgpr(0)),                  // keep local thread id
+        0xD4C20010, 0x00020080,             // v_cmp_eq_u32 s[16:17], 0, v0
+        0xBE922410,                         // s_and_saveexec_b64 s[18:19], s[16:17]
+        vop1(1,0,128),
+        0xD8380100, 0x00000000,             // ds_write2_b32 v0,v0,v0 offset1:1
+        0xBEFE0412,                         // restore EXEC
+        0xBE94047E,                         // s_mov_b64 s[20:21], exec
+        vop1(1,3,193),                     // rank = -1
+        0x7DA80200,                         // v_cmpx_gt_u32 exec, s0, v1
+    ];
+    let empty = w.len(); w.push(0);
+    w.extend([
+        vop1(1,3,129), vop1(1,2,128),
+        0xD8800004, 0x03000302,             // ds_add_rtn_u32 v3,v2,v3 offset:4
+        0x7DA40201,                         // v_cmpx_eq_u32 exec,s1,v1
+    ]);
+    let nocap = w.len(); w.push(0);
+    w.push(s_mov_b32(22,128));
+    let header = w.len();
+    w.push(sop2(0,22,22,129));              // s_add_u32 s22,s22,1
+    w.push(0xBF060216);                     // s_cmp_eq_u32 s22,s2
+    let finished = w.len(); w.push(0);
+    let again = w.len(); w.push(0);
+    let gate = w.len();
+    w.extend([0xBEFE0414, 0xBE922410]);     // restore full EXEC, select lane zero
+    let skip = w.len(); w.push(0);
+    w.extend([
+        vop1(1,2,128), vop1(1,4,128),
+        0xD8D80004, 0x05000002,             // ds_read_b32 v5,v2 offset:4
+        0xE0C85000, 0x80020504,             // buffer_atomic_add v5,v4,s[8:11],0 offen glc
+        0xD8340000, 0x00000502,             // ds_write_b32 v2,v5
+    ]);
+    let publish = w.len();
+    w.extend([0xBEFE0412, 0x7D2206C1]);     // restore EXEC, rank >= 0
+    let skip_store = w.len(); w.push(0);
+    w.extend([
+        vop1(1,2,128),
+        0xD8D80000, 0x02000002,             // ds_read_b32 v2,v2
+        vop2(0x25,3,vgpr(2),3),            // base + rank
+        vop2(0x25,3,129,3),                // +1: distinguish untouched zero
+        vop2(0x25,4,129,1),                // address = (thread id + 1)*4
+        vop2(0x1A,4,130,4),
+        buffer_store_dword_offen(3,4,8)[0],
+        buffer_store_dword_offen(3,4,8)[1],
+    ]);
+    let end = w.len(); w.push(S_ENDPGM);
+    branch(&mut w, empty, gate, 0xBF880000);
+    branch(&mut w, nocap, gate, 0xBF880000);
+    branch(&mut w, finished, gate, 0xBF850000);
+    branch(&mut w, again, header, 0xBF820000);
+    branch(&mut w, skip, publish, 0xBF880000);
+    branch(&mut w, skip_store, end, 0xBF880000);
+    for conditional in [false,true] {
+    let mut words = w.clone();
+    if conditional {
+        branch(&mut words, finished, header, 0xBF840000);
+        branch(&mut words, again, gate, 0xBF820000);
+    }
+    let shader = lower::with_allocation_test_limit(2, || build_cs_config(&words,64,true,512,true));
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root,pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("{label}: {e}"));
+        for (count, loop_lane, bound, abort) in [
+            (0,64,4,false),(1,64,4,false),(31,64,4,false),(32,64,4,false),
+            (33,64,4,false),(64,64,4,false),(64,31,1,false),(64,31,4,true),
+        ] {
+            let inputs = [count, loop_lane, bound, 0];
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root,u.slot) {
+                    (RootType::Constants,0) => inputs[u.dword as usize],
+                    (RootType::Table,1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host.dispatch(&root,&pso,&Dispatch {
+                roots: vec![(0,Root::Constants(ud))], views: &[View::RawUav(65)],
+                samplers: &[], groups: [1,1,1],
+            }).unwrap_or_else(|e| panic!("{label}: {e}"));
+            if abort {
+                assert!(out[0].iter().all(|&x| x == 0), "{label}: partial allocation on cap");
+            } else {
+                assert_eq!(out[0][0], count, "{label}: count");
+                let mut ranks = out[0][1..=count as usize].to_vec();
+                ranks.sort_unstable();
+                assert_eq!(ranks, (1..=count).collect::<Vec<_>>(), "{label}: ranks");
+                assert!(out[0][count as usize+1..].iter().all(|&x| x == 0), "{label}: nonparticipant wrote");
+            }
+        }
+        ran += 1;
+        eprintln!("{label}: allocation ranks and cap passed (conditional={conditional})");
+    }
+    assert!(ran > 0);
+    }
 }
 
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
@@ -1343,6 +1654,29 @@ fn sdwa_16bit_dst_unused_sext_sign_extends_word0() {
 }
 
 #[test]
+fn bounded_m0_moves_do_not_read_descriptor_words() {
+    let mut body = Vec::new();
+    for k in 0..4u8 {
+        body.push(vop1(0x001, 8+k, 138 + u16::from(k)));
+        body.push(vop1(0x001, 12+k, sgpr(8+k)));
+    }
+    body.extend(vop3(0x159, 5, vgpr(1), 128, 131));
+    body.push(vop1(0x002, 12, vgpr(5)));
+    body.push(s_mov_b32(124, 12));
+    body.push(vop1(0x042, 8, vgpr(3)));
+    body.push(0x1B << 25 | 6 << 17 | 2 << 9 | 131);
+    body.push(vop1(0x002, 12, vgpr(6)));
+    body.push(s_mov_b32(124, 12));
+    body.push(vop1(0x043, 0, vgpr(8)));
+    let shader = build_valu_cs_vgprs(&body, 16);
+    let cases = [[0,0,77,0], [5,3,77,0], [1,2,77,0], [u32::MAX,7,77,0], [2,1,77,0], [3,0,77,0]];
+    run_cases(&shader, &cases, |backend, _, [a,b,c,_], got| {
+        let (i,j) = (a.min(3), b & 3);
+        assert_eq!(got, if i == j { c } else { 10+j }, "{backend}: {a:#x} {b:#x}");
+    });
+}
+
+#[test]
 fn m0_relative_swaps_and_moves_index_source_and_destination_apart() {
     // v1..v4 = 10, 20, 30, 40. v_movrelsd_2_b32 and v_swaprel_b32 offset
     // their source by M0[9:0] and their destination by M0[25:16]; other M0
@@ -1554,6 +1888,119 @@ fn swizzle_32(offset: u16) -> Vec<Vec<u32>> {
         eprintln!("no SM 6.6 device with 32-lane waves; skipped");
     }
     out
+}
+
+/// Exercise the logical wave64 with two-dimensional native thread IDs,
+/// swizzles in both 32-lane halves, fixed reads across halves, and reuse of
+/// an overwritten VGPR (distinct SSA snapshot). Integer payloads make every
+/// bit of lane selection observable without float rounding tolerances.
+#[test]
+fn logical_lane_snapshot_numerical() {
+    let mut words = vec![s_mov_b32(5, 128)];
+    words.extend(s_load_dwordx4(8,4));
+    words.extend(vop3(0x346,1,vgpr(1),131,vgpr(0))); // v1 = y*8+x
+    words.push(vop2(0x25,2,129,1));                   // v2 = flat+1
+    words.extend(ds_swizzle_b32(3,2,0x401f));         // xor16
+    words.extend(ds_swizzle_b32(6,2,0x101f));         // xor4; same snapshot
+    words.extend(vop3(0x360,6,vgpr(2),160,0));         // s6 = lane32
+    words.extend(vop3(0x360,7,vgpr(2),128,0));         // s7 = lane0
+    words.push(vop2(0x25,2,129,2));                   // v2 = flat+2 (new SSA)
+    words.extend(vop3(0x360,12,vgpr(2),164,0));        // s12 = lane36
+    words.push(vop2(0x1A,4,133,1));                   // byte address flat*32
+    for (offset, reg, scalar) in [(0,3,false),(4,6,false),(8,6,true),(12,7,true),(16,12,true)] {
+        let data = if scalar { words.push(vop1(1,5,sgpr(reg))); 5 } else { reg };
+        let mut store = buffer_store_dword_offen(data,4,8);
+        store[0] |= offset;
+        words.extend(store);
+    }
+    words.push(S_ENDPGM);
+    let shader = build_cs_group(&words,[8,8,1],true,0,false);
+    let container = crate::dxbc::Container::parse(&shader.dxil).unwrap();
+    let flags = u64::from_le_bytes(container.part(crate::dxbc::FourCC::SFI0).unwrap().data.try_into().unwrap());
+    assert_eq!(flags & 0x4000,0);
+    let psv = container.part(crate::dxbc::FourCC::PSV0).unwrap().data;
+    assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()),0);
+    assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()),u32::MAX);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware",false),("warp",true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root,pso) = host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let ud = vec![0u32;shader.user_data_dwords().max(1) as usize];
+        let out = host.dispatch(&root,&pso,&Dispatch { roots:vec![(0,Root::Constants(ud))],
+            views:&[View::RawUav(64*8)],samplers:&[],groups:[1,1,1] }).unwrap_or_else(|e| panic!("{label}: {e}"));
+        for (lane, record) in out[0].chunks_exact(8).enumerate() {
+            assert_eq!(record, &[(lane as u32^16)+1,(lane as u32^4)+1,33,1,38,0,0,0],
+                "{label}: lane {lane}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0);
+}
+
+/// The basic modes: a quad permutation and a 32-lane and/or/xor mapping.
+#[test]
+fn logical_lane_hierarchical_reduction_numerical() {
+    let mut w = vec![s_mov_b32(5,128)];
+    w.extend(s_load_dwordx4(8,4));
+    w.extend(vop3(0x346,1,vgpr(1),131,vgpr(0))); // flat ID
+    // Strictly decreasing input, so the minimum of a neighborhood may
+    // come from a different host warp. All inputs and arithmetic exact.
+    w.push(vop2(0x26,3,192,1)); // 64 - flat
+    w.push(vop2(0x1A,4,132,1)); // byte address = 16*flat
+    w.extend(ds_swizzle_b32(5,3,0x201f)); // xor 8
+    w.push(vop2(0x13,3,vgpr(5),3)); // min
+    w.extend(ds_swizzle_b32(5,3,0x041f)); // xor 1
+    w.push(vop2(0x13,3,vgpr(5),3));
+    w.extend(vop3(0x365,2,193,128,0)); // mbcnt lo(-1,0)
+    w.extend(vop3(0x366,2,193,vgpr(2),0)); // mbcnt hi(-1,lo)
+    w.push(vop2(0x1b,6,137,2)); // lane & 9
+    w.extend([0xBE90047E,0x7DA40C80]); // save EXEC, cmpx_eq 0,v6
+    let skip = w.len(); w.push(0);
+    w.extend(buffer_store_dword_offen(3,4,8));
+    let join = w.len(); w.push(0xBEFE0410); // restore full EXEC
+    w[skip] = 0xBF880000 | ((join as isize-skip as isize-1) as i16 as u16 as u32);
+    for offset in [0x401f,0x081f] { // xor 16,2
+        w.extend(ds_swizzle_b32(5,3,offset));
+        w.push(vop2(0x13,3,vgpr(5),3));
+    }
+    w.push(vop2(0x1b,6,155,2)); // lane & 27
+    w.extend([0xBE90047E,0x7DA40C80]);
+    let skip = w.len(); w.push(0);
+    let mut store = buffer_store_dword_offen(3,4,8); store[0] |= 4; w.extend(store);
+    let join = w.len(); w.push(0xBEFE0410);
+    w[skip] = 0xBF880000 | ((join as isize-skip as isize-1) as i16 as u16 as u32);
+    w.extend(ds_swizzle_b32(5,3,0x101f)); // xor 4: full 32-lane half
+    w.push(vop2(0x13,3,vgpr(5),3));
+    w.extend(vop3(0x360,12,vgpr(3),160,0)); // scalar lane 32
+    // For every lane, test the half reduction and exact lane number.
+    let mut store = buffer_store_dword_offen(3,4,8); store[0] |= 8; w.extend(store);
+    w.extend([0xBE90047E,0x7DA40480]); // only lane 0 commits full reduction
+    let skip = w.len(); w.push(0);
+    w.push(vop2(0x13,3,sgpr(12),3));
+    let mut store = buffer_store_dword_offen(3,4,8); store[0] |= 12; w.extend(store);
+    let end = w.len(); w.push(S_ENDPGM);
+    w[skip] = 0xBF880000 | ((end as isize-skip as isize-1) as i16 as u16 as u32);
+    let shader = build_cs_group(&w,[8,8,1],true,0,false);
+    let c = crate::dxbc::Container::parse(&shader.dxil).unwrap();
+    assert_eq!(u64::from_le_bytes(c.part(crate::dxbc::FourCC::SFI0).unwrap().data.try_into().unwrap()) & 0x4000,0);
+    let psv = c.part(crate::dxbc::FourCC::PSV0).unwrap().data;
+    assert_eq!(u32::from_le_bytes(psv[20..24].try_into().unwrap()),0);
+    assert_eq!(u32::from_le_bytes(psv[24..28].try_into().unwrap()),u32::MAX);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e|e.into_inner());
+    let mut ran = 0;
+    for (label,warp) in [("hardware",false),("warp",true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root,pso) = host.compute_pipeline(&shader).unwrap_or_else(|e|panic!("{label}: {e}"));
+        let ud = vec![0;shader.user_data_dwords().max(1) as usize];
+        let out = host.dispatch(&root,&pso,&Dispatch { roots:vec![(0,Root::Constants(ud))],views:&[View::RawUav(64*4)],samplers:&[],groups:[1,1,1] }).unwrap_or_else(|e|panic!("{label}: {e}"));
+        for (lane,record) in out[0].chunks_exact(4).enumerate() {
+            let l = lane as u32;
+            assert_eq!(record,&[if l&9==0 {64-(l|9)} else {0},if l&27==0 {64-(l|27)} else {0},if l<32 {33} else {1},if l==0 {1} else {0}],"{label}: lane {l}");
+        }
+        ran += 1;
+    }
+    assert!(ran>0);
 }
 
 /// The basic modes: a quad permutation and a 32-lane and/or/xor mapping.
@@ -1910,6 +2357,10 @@ fn root_view_reads_stop_at_the_bound_size() {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        static_table_cbvs: lowered.static_table_cbvs,
+        heap_buffer_classes: lowered.heap_buffer_classes,
+        heap_demands: lowered.heap_demands,
     };
     assert_eq!(shader.root_srvs, [2]);
     assert!(

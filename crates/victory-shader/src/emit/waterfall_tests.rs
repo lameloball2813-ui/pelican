@@ -82,6 +82,10 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        static_table_cbvs: lowered.static_table_cbvs,
+        heap_buffer_classes: lowered.heap_buffer_classes,
+        heap_demands: lowered.heap_demands,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())

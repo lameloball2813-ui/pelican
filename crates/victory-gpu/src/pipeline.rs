@@ -103,6 +103,9 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
     pub(crate) used: Vec<victory_shader::UsedResource>,
+    /// View tables whose actual native descriptor accesses fit the named
+    /// slots. Their unreferenced holes need not own host heap slots.
+    pub(crate) sparse_tables: Vec<u8>,
 }
 
 #[cfg(windows)]
@@ -153,7 +156,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     let host = crate::shader_cache::host_shader(container)?;
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let used = match c.part(FourCC::DXIL) {
+    let native = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)
             .map_err(|e| e.to_string())?
             .into_iter()
@@ -162,12 +165,140 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
                     p.stage,
                     HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
                 )
-            })
-            .map(|p| p.used)
-            .unwrap_or_default(),
-        None => Vec::new(),
+            }),
+        None => None,
     };
-    Ok(Translated { host, used })
+    let sparse_tables = native.as_ref().map_or_else(Vec::new, sparse_tables);
+    let used = native.map(|p| p.used).unwrap_or_default();
+    Ok(Translated { host, used, sparse_tables })
+}
+
+/// Prove that a table can keep its original relative descriptor indices
+/// while leasing only the named slots. The native used-resource list alone
+/// is not a proof: its entries can denote the start of a descriptor array.
+#[cfg(windows)]
+fn sparse_tables(native: &victory_shader::NativeProgram) -> Vec<u8> {
+    use victory_shader::{ResourceType, RootType, ir, resource, structure};
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut slots = BTreeMap::<u8, BTreeSet<u32>>::new();
+    let mut refused = BTreeSet::new();
+    for u in native.used.iter().filter(|u| u.root == RootType::Table) {
+        if !matches!(u.kind, ResourceType::Cbv | ResourceType::Srv | ResourceType::Uav)
+            || !matches!(u.dwords, 4 | 8) || u.table_offset_dwords % 8 != 0
+            || !native.layout.iter().any(|r| r.root == RootType::Table
+                && r.slot == u.slot && r.user_data == u.user_data)
+        {
+            refused.insert(u.slot);
+        }
+        if !slots.entry(u.slot).or_default().insert(u.table_offset_dwords / 8) {
+            refused.insert(u.slot);
+        }
+    }
+    // Only analyze actual candidates with material savings; this is done
+    // once per shader, also on a disk-cache hit, not on each draw.
+    slots.retain(|slot, offsets| !refused.contains(slot)
+        && native.layout.iter().filter(|r| r.root == RootType::Table && r.slot == *slot)
+            .all(|r| r.sgprs == 1)
+        && offsets.last().is_some_and(|&last| last >= 16
+            && u64::from(last) + 1 >= 2 * offsets.len() as u64));
+    if slots.is_empty() { return Vec::new(); }
+    let Ok(p) = ir::build(&native.patched_code(), native.wave64, native.vgprs) else {
+        return Vec::new();
+    };
+    let Ok(st) = structure::structure(&p) else { return Vec::new(); };
+    let Ok(res) = resource::track(&p, &native.layout, native.stage, Some(&st)) else {
+        return Vec::new();
+    };
+    let mut seen = BTreeSet::new();
+    for &(site, a) in &res.scalar {
+        let Some(root) = native.layout.get(a.param) else { continue; };
+        if root.root != RootType::Table { continue; }
+        let Some(offsets) = slots.get(&root.slot) else { continue; };
+        let inst = &p.blocks[site.0].insts[site.1];
+        // Reject fetched/vector descriptors and computed array offsets.
+        // Every byte of a scalar descriptor load must fall in named slots.
+        let words = match inst.name() {
+            "s_load_dword" => 1,
+            "s_load_dwordx2" => 2,
+            "s_load_dwordx4" => 4,
+            "s_load_dwordx8" => 8,
+            "s_load_dwordx16" => 16,
+            _ => 0,
+        };
+        if words == 0 || a.dynamic.is_some() || a.offset % 4 != 0
+            || res.waterfall.loads.contains(&site)
+            || !a.offset.checked_add(words * 4 - 1).is_some_and(|end|
+                (a.offset / 32..=end / 32).all(|k| offsets.contains(&k)))
+        {
+            refused.insert(root.slot);
+        } else {
+            seen.insert(root.slot);
+        }
+    }
+    // Every descriptor leaf must also be consistent with the view heap.
+    // A built address or per-lane load from a table is not covered by the
+    // static scalar-load proof.
+    for d in &res.descriptors {
+        for leaf in d.source.leaves() {
+            let (a, first, loaded) = match *leaf {
+                resource::Source::Loaded { load, first } =>
+                    (res.scalar.iter().find(|s| s.0 == load).map(|s| s.1), first, true),
+                resource::Source::Fetched { load, first } =>
+                    (res.scalar.iter().find(|s| s.0 == load).map(|s| s.1), first, false),
+                resource::Source::Built { address, .. } => (Some(address), 0, false),
+                _ => continue,
+            };
+            let Some(a) = a else { return Vec::new(); };
+            let Some(root) = native.layout.get(a.param) else { continue; };
+            if root.root != RootType::Table { continue; }
+            let Some(offsets) = slots.get(&root.slot) else { continue; };
+            if !loaded || d.role != resource::Role::Resource
+                || !a.offset.checked_add(u32::from(first) * 4)
+                    .is_some_and(|byte| offsets.contains(&(byte / 32)))
+            {
+                refused.insert(root.slot);
+            }
+        }
+    }
+    // A relocated table base must not escape as ordinary data or be used
+    // to construct an unrelated bindless index. Descriptor loads terminate
+    // this analysis: their results describe the same actual view in either
+    // layout, not the numeric host table base.
+    for &slot in slots.keys() {
+        if refused.contains(&slot) { continue; }
+        let mut addresses: BTreeSet<_> = res.params.iter().filter_map(|&(v, param, _)| {
+            let root = native.layout.get(param)?;
+            (root.root == RootType::Table && root.slot == slot).then_some(v)
+        }).collect();
+        loop {
+            let before = addresses.len();
+            for (b, block) in p.blocks.iter().enumerate() {
+                for phi in &block.phis {
+                    if phi.args.iter().any(|v| addresses.contains(v)) {
+                        addresses.insert(phi.value);
+                    }
+                }
+                for (i, inst) in block.insts.iter().enumerate() {
+                    if !inst.reads.iter().any(|&(_, v)| addresses.contains(&v)) { continue; }
+                    let own_load = res.scalar.iter().any(|&(site, a)| {
+                        site == (b, i) && native.layout.get(a.param)
+                            .is_some_and(|r| r.root == RootType::Table && r.slot == slot)
+                    });
+                    if own_load { continue; }
+                    if !matches!(inst.name(), "s_mov_b32" | "s_mov_b64" |
+                        "s_add_u32" | "s_add_i32" | "s_addc_u32")
+                    {
+                        refused.insert(slot);
+                        break;
+                    }
+                    addresses.extend(inst.writes.iter().map(|&(_, v)| v));
+                }
+                if refused.contains(&slot) { break; }
+            }
+            if refused.contains(&slot) || before == addresses.len() { break; }
+        }
+    }
+    slots.into_keys().filter(|slot| seen.contains(slot) && !refused.contains(slot)).collect()
 }
 
 #[repr(C)]
@@ -327,7 +458,7 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = make::Pending::intern(shaders.clone(), graphics);
     #[cfg(windows)]
     make::early(&host);
     let pipeline = Box::new(Pipeline {
@@ -524,6 +655,54 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn sparse_table_proof_accepts_static_offsets_and_refuses_arrays() {
+        use victory_shader::{HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource};
+        let words: [u32; 13] = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, 0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x8F06_8501, // s_lshl_b32 s6, s1, 5
+            0xF408_0302, 0xFA00_2020, // s_load_dwordx4 s[12:15], s[4:5], 257*32
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0x8590_0C08, // s_cselect_b64 s[16:17], s[8:9], s[12:13]
+            0x8592_0E0A, // s_cselect_b64 s[18:19], s[10:11], s[14:15]
+            0xE030_2000, 0x8004_0100, // buffer_load_dword v1, v0, s[16:19], 0 idxen
+            0xBF81_0000, // s_endpgm
+        ];
+        let root = |root, user_data, slot| RootParam {
+            root, user_data, slot, table_offset_dwords: 0, sgprs: 1, base_register: 0,
+        };
+        let used = |offset| UsedResource {
+            kind: ResourceType::Srv, root: RootType::Table, table_offset_dwords: offset,
+            lower_bound: 0, stride: 4, dwords: 4, user_data: 0, slot: 0,
+        };
+        let mut native = NativeProgram {
+            stage: HwStage::Cs, wave64: false, vgprs: 8,
+            layout: vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)],
+            used: vec![used(0), used(257 * 8)],
+            io: Default::default(),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        assert_eq!(super::sparse_tables(&native), [0]);
+        // A static load in an unnamed slot, a load spanning into a hole,
+        // and a runtime offset must all fall back to full allocation.
+        for offset_word in [0xFA00_0020u32, 0xFA00_001C, 0x0C00_2020] {
+            native.code[6 * 4..7 * 4].copy_from_slice(&offset_word.to_le_bytes());
+            let p = victory_shader::ir::build(&native.code, false, 8).unwrap();
+            let st = victory_shader::structure::structure(&p).unwrap();
+            let res = victory_shader::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            if offset_word == 0x0C00_2020 {
+                assert!(res.scalar.iter().any(|(_, a)| a.dynamic.is_some()));
+            }
+            assert!(super::sparse_tables(&native).is_empty());
+        }
+        native.code[6 * 4..7 * 4].copy_from_slice(&0xFA00_2020u32.to_le_bytes());
+        native.code[7 * 4..8 * 4].copy_from_slice(&0xBF06_8000u32.to_le_bytes()); // compare table address
+        assert!(super::sparse_tables(&native).is_empty());
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {

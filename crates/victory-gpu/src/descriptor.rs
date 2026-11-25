@@ -324,8 +324,18 @@ impl View {
 /// views, samplers) are kept for the run; they are bounded by the title's
 /// memory and sampler states.
 struct Views {
+    /// Changes on every registry entry creation, reuse or invalidation.
+    /// Raw descriptor bytes can stay identical while their meaning changes.
+    revision: u64,
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
+    /// A freed generation is not live until it is actually interned again.
+    live: Vec<bool>,
+    /// Recent mutations are a fast path for validating large dependency sets.
+    changes: std::collections::VecDeque<(u64, u32)>,
+    /// Last mutation of each index, including freed generations. This is
+    /// sufficient to validate an arbitrarily old dependency set exactly.
+    changed_at: Vec<u64>,
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -333,7 +343,11 @@ struct Views {
 }
 
 static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+    revision: 0,
     list: Vec::new(),
+    live: Vec::new(),
+    changes: std::collections::VecDeque::new(),
+    changed_at: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
@@ -351,32 +365,91 @@ impl View {
     }
 }
 
+impl Views {
+    fn changed(&mut self, index: u32) {
+        self.revision = self.revision.checked_add(1).expect("view revision exhausted");
+        let i = index as usize;
+        if self.changed_at.len() <= i { self.changed_at.resize(i + 1, 0); }
+        self.changed_at[i] = self.revision;
+        self.changes.push_back((self.revision, index));
+        if self.changes.len() > 8192 { self.changes.pop_front(); }
+    }
+
+    fn unchanged_since(&self, since: u64, dependencies: &std::collections::HashSet<u32>) -> bool {
+        if since == self.revision { return true; }
+        if since > self.revision { return false; }
+        if let Some(&(first, _)) = self.changes.front()
+            && since >= first - 1
+            && self.revision - since <= dependencies.len() as u64
+        {
+            return self.changes.iter().skip((since + 1 - first) as usize)
+                .all(|&(_, index)| !dependencies.contains(&index));
+        }
+        dependencies.iter().all(|&i| {
+            self.changed_at.get(i as usize).copied().unwrap_or(0) <= since
+        })
+    }
+
+    fn get(&self, index: u32, generation: u32) -> Option<&View> {
+        let (view, current) = self.list.get(index as usize)?;
+        (*current == generation && self.live[index as usize]).then_some(view)
+    }
+
+    /// Intern while holding VIEWS; creating even an entry previously absent
+    /// from all live descriptors changes the meaning of possible raw tags.
+    fn intern(&mut self, view: View) -> (u32, u32) {
+    let i = match self.index.get(&view) {
+        Some(&i) => i,
+        None => {
+            let i = match self.free.pop() {
+                Some(i) => {
+                    self.list[i as usize].0 = view.clone();
+                    self.live[i as usize] = true;
+                    i
+                }
+                None => {
+                    self.list.push((view.clone(), 1));
+                    self.live.push(true);
+                    self.list.len() as u32 - 1
+                }
+            };
+            self.changed(i);
+            for r in view.resources().into_iter().filter(|&r| r != 0) {
+                self.by_resource.entry(r).or_default().push(i);
+            }
+            self.index.insert(view, i);
+            i
+        }
+    };
+    (i, self.list[i as usize].1)
+    }
+
+    fn forget(&mut self, resource: usize) {
+        let Some(entries) = self.by_resource.remove(&resource) else {
+            return;
+        };
+        for i in entries {
+            let (view, generation) = self.list[i as usize].clone();
+            if self.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
+                continue;
+            }
+            self.index.remove(&view);
+            self.changed(i);
+            self.list[i as usize].1 = generation.wrapping_add(1).max(1);
+            self.live[i as usize] = false;
+            // The view's other resource (a counter) keeps a stale entry,
+            // which a later forget skips.
+            self.free.push(i);
+        }
+    }
+}
+
 fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let i = match views.index.get(&view) {
-        Some(&i) => i,
-        None => {
-            let i = match views.free.pop() {
-                Some(i) => {
-                    views.list[i as usize].0 = view.clone();
-                    i
-                }
-                None => {
-                    views.list.push((view.clone(), 1));
-                    views.list.len() as u32 - 1
-                }
-            };
-            for r in view.resources().into_iter().filter(|&r| r != 0) {
-                views.by_resource.entry(r).or_default().push(i);
-            }
-            views.index.insert(view, i);
-            i
-        }
-    };
-    let generation = views.list[i as usize].1;
+    let (i, generation) = views.intern(view);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     drop(views);
@@ -386,31 +459,14 @@ fn record(handle: u64, view: View) {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(entries) = views.by_resource.remove(&resource) else {
-        return;
-    };
-    for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
-        // Entries freed through a view's other resource may hold another
-        // view by now.
-        if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
-            continue;
-        }
-        views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
-        // The view's other resource (a counter) keeps a stale entry, which
-        // `forget` of that resource skips.
-        views.free.push(i);
-    }
+    VIEWS.lock().unwrap_or_else(|e| e.into_inner()).forget(resource);
 }
 
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    views.get(i, generation).cloned()
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -421,8 +477,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
     let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    (tag == VIEW_TAG).then(|| views.get(i, generation)).flatten().cloned()
 }
 
 /// A description of `N` words, if the title passes one.

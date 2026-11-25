@@ -585,6 +585,25 @@ pub(crate) struct Memory {
     attributes: Option<u64>,
 }
 
+// Separate runtime-owned zeroed allocations from allocations supplied by
+// the title's hooked allocator, which may overlap its physical-page budget.
+#[cfg(feature = "diagnostics")]
+static MEMORY_BYTES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn memory_bytes() -> [u64; 2] {
+    std::array::from_fn(|i| MEMORY_BYTES[i].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(feature = "diagnostics")]
+fn note_memory(size: usize, title: bool) {
+    let old = MEMORY_BYTES[usize::from(title)].fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
+    if (old + size as u64) >> 28 != old >> 28 {
+        tracing::info!(title_allocator = title, live_bytes = old + size as u64, "live title graphics memory");
+    }
+}
+
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
 pub type FreeRoutine = extern "system" fn(*mut c_void, u64);
 static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::OnceLock::new();
@@ -642,6 +661,8 @@ impl Memory {
             NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
         // SAFETY: the allocator handed out `size` bytes.
         unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
+        #[cfg(feature = "diagnostics")]
+        note_memory(layout.size(), true);
         Ok(Memory {
             ptr,
             layout,
@@ -667,6 +688,8 @@ impl Memory {
             .ok_or(E_INVALIDARG)?;
         // SAFETY: the size is non-zero.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
+        #[cfg(feature = "diagnostics")]
+        note_memory(layout.size(), false);
         Ok(Memory {
             ptr,
             layout,
@@ -677,6 +700,8 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        MEMORY_BYTES[usize::from(self.attributes.is_some())].fetch_sub(self.layout.size() as u64, std::sync::atomic::Ordering::Relaxed);
         match (self.attributes, ALLOCATOR.get()) {
             (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
             // SAFETY: allocated in `new` with this layout.
@@ -752,6 +777,9 @@ enum Backing {
     },
     /// Memory the title mapped itself, at this address.
     Address(*mut u8),
+    /// An internal resource owned by the address/description texture cache.
+    #[cfg(windows)]
+    Synthetic(*mut u8),
 }
 
 impl Drop for Backing {
@@ -772,7 +800,11 @@ struct Resource {
     /// Textures also live on the host GPU (decision 0007); buffers do not
     /// yet.
     #[cfg(windows)]
-    host: Option<std::sync::Arc<HostTexture>>,
+    host: std::sync::OnceLock<Option<std::sync::Arc<HostTexture>>>,
+    #[cfg(windows)]
+    initial_state: u32,
+    #[cfg(windows)]
+    initial_clear: Option<[u32; 5]>,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -785,6 +817,123 @@ struct Resource {
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
     pub(crate) state: std::sync::atomic::AtomicU32,
+    pub(crate) twin: std::sync::OnceLock<Option<crate::twin::Twin>>,
+    #[cfg(feature = "diagnostics")]
+    allocation_bytes: u64,
+    #[cfg(feature = "diagnostics")]
+    origin: usize,
+}
+
+#[cfg(windows)]
+impl HostTexture {
+    /// A GPU-only internal texture, retained by its canonical depth copy.
+    pub(crate) fn internal(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> std::sync::Arc<Self> {
+        #[cfg(feature = "diagnostics")]
+        let allocation_bytes = {
+            use std::sync::atomic::Ordering::Relaxed;
+            let host = crate::host::host().expect("a texture has a host device");
+            let info = unsafe { host.device.GetResourceAllocationInfo(0, &[texture.GetDesc()]) };
+            let bytes = if info.SizeInBytes == u64::MAX { 0 } else { info.SizeInBytes };
+            HOST_TEXTURE_BYTES.fetch_add(bytes, Relaxed);
+            HOST_TEXTURE_COUNT.fetch_add(1, Relaxed);
+            HOST_ORIGIN_BYTES[3].fetch_add(bytes, Relaxed);
+            HOST_ORIGIN_COUNTS[3].fetch_add(1, Relaxed);
+            bytes
+        };
+        std::sync::Arc::new(Self {
+            texture,
+            state: 0.into(),
+            twin: Default::default(),
+            #[cfg(feature = "diagnostics")]
+            allocation_bytes,
+            #[cfg(feature = "diagnostics")]
+            origin: 3,
+        })
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+static HOST_TEXTURE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(all(windows, feature = "diagnostics"))]
+static HOST_TEXTURE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(all(windows, feature = "diagnostics"))]
+static HOST_ORIGIN_BYTES: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+#[cfg(all(windows, feature = "diagnostics"))]
+static HOST_ORIGIN_COUNTS: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn host_texture_totals() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    tracing::info!(
+        committed_bytes = HOST_ORIGIN_BYTES[0].load(Relaxed),
+        committed_count = HOST_ORIGIN_COUNTS[0].load(Relaxed),
+        placed_bytes = HOST_ORIGIN_BYTES[1].load(Relaxed),
+        placed_count = HOST_ORIGIN_COUNTS[1].load(Relaxed),
+        address_bytes = HOST_ORIGIN_BYTES[2].load(Relaxed),
+        address_count = HOST_ORIGIN_COUNTS[2].load(Relaxed),
+        synthetic_bytes = HOST_ORIGIN_BYTES[3].load(Relaxed),
+        synthetic_count = HOST_ORIGIN_COUNTS[3].load(Relaxed),
+        "host texture origins (Arc lifetime lower bound)"
+    );
+    (HOST_TEXTURE_BYTES.load(Relaxed), HOST_TEXTURE_COUNT.load(Relaxed))
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+impl Drop for HostTexture {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        HOST_TEXTURE_BYTES.fetch_sub(self.allocation_bytes, Relaxed);
+        HOST_TEXTURE_COUNT.fetch_sub(1, Relaxed);
+        HOST_ORIGIN_BYTES[self.origin].fetch_sub(self.allocation_bytes, Relaxed);
+        HOST_ORIGIN_COUNTS[self.origin].fetch_sub(1, Relaxed);
+    }
+}
+
+#[cfg(windows)]
+impl Resource {
+    /// Materialize exactly once, with the original creation parameters.
+    /// Buffers have no host texture; their shadows are managed separately.
+    fn host_texture_copy(&self) -> Option<&std::sync::Arc<HostTexture>> {
+        if self.desc.dimension == BUFFER {
+            return None;
+        }
+        self.host.get_or_init(|| {
+            let clear = self.initial_clear.as_ref().map_or(std::ptr::null(), |v| v.as_ptr().cast());
+            let texture = host_texture(&self.desc, self.initial_state, clear)?;
+            let state = crate::host::legal_state(&texture, crate::host::texture_state(self.initial_state));
+            #[cfg(feature = "diagnostics")]
+            let (allocation_bytes, origin) = {
+                use std::sync::atomic::Ordering::Relaxed;
+                let origin = match &self.backing {
+                    Backing::Committed(_) => 0,
+                    Backing::Placed { .. } => 1,
+                    Backing::Address(_) => 2,
+                    Backing::Synthetic(_) => 3,
+                };
+                let host = crate::host::host().expect("a texture has a host device");
+                // SAFETY: resource and device are live.
+                let info = unsafe { host.device.GetResourceAllocationInfo(0, &[texture.GetDesc()]) };
+                let bytes = if info.SizeInBytes == u64::MAX { 0 } else { info.SizeInBytes };
+                HOST_TEXTURE_BYTES.fetch_add(bytes, Relaxed);
+                HOST_TEXTURE_COUNT.fetch_add(1, Relaxed);
+                HOST_ORIGIN_BYTES[origin].fetch_add(bytes, Relaxed);
+                HOST_ORIGIN_COUNTS[origin].fetch_add(1, Relaxed);
+                (bytes, origin)
+            };
+            Some(std::sync::Arc::new(HostTexture {
+                texture,
+                state: state.into(),
+                twin: Default::default(),
+                #[cfg(feature = "diagnostics")]
+                allocation_bytes,
+                #[cfg(feature = "diagnostics")]
+                origin,
+            }))
+        }).as_ref()
+    }
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -792,7 +941,7 @@ pub(crate) struct HostTexture {
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let host = resource(this).host.as_ref()?;
+    let host = resource(this).host_texture_copy()?;
     let before = host
         .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
@@ -807,7 +956,7 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_deref().map(|h| &h.texture)
+    resource(this).host_texture_copy().map(|h| &h.texture)
 }
 
 /// A title texture's host copy, shared, for a list to hold.
@@ -816,7 +965,21 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     if this.is_null() {
         return None;
     }
-    resource(this).host.clone()
+    resource(this).host_texture_copy().cloned()
+}
+
+/// Restrict the depth twin to original object-backed, single-plane D16
+/// resources. Synthetic alias views have no proven writer identity.
+#[cfg(windows)]
+pub(crate) fn d16_twin_candidate(this: This) -> bool {
+    if this.is_null() { return false; }
+    let r = resource(this);
+    let d = &r.desc;
+    !matches!(&r.backing, Backing::Synthetic(_))
+        && d.dimension == 3 && matches!(d.format, 53 | 55)
+        && d.flags & 2 != 0 && d.width != 0 && d.height != 0
+        && d.depth_or_array_size == 1 && d.mip_levels == 1
+        && d.sample_count == 1 && d.sample_quality == 0
 }
 
 /// A host texture like the title's: same description, in GPU memory,
@@ -886,22 +1049,28 @@ fn host_texture(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    let mut texture: Option<ID3D12Resource> = None;
+    let initial = D3D12_RESOURCE_STATES(
+        crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+    );
+    let mut texture: Option<ID3D12Resource> = if clear_value.is_none() {
+        // SAFETY: ResourceDesc has the checked host layout used below.
+        crate::texture_heap::allocate(&host.device, unsafe { &*(&raw const d).cast() }, initial)
+    } else {
+        None
+    };
     // SAFETY: the description has the host layout (checked size, same
     // fields); the out pointer is ours.
-    let made = unsafe {
+    let made = if texture.is_some() { Ok(()) } else { unsafe {
         host.device.CreateCommittedResource(
             &heap,
             D3D12_HEAP_FLAG_NONE,
             (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
+            initial,
             // The same layout: format, then color or depth and stencil.
             clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
             &mut texture,
         )
-    };
+    }};
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }
@@ -944,6 +1113,8 @@ impl Resource {
                     .add(offset as usize)
             },
             Backing::Address(at) => at,
+            #[cfg(windows)]
+            Backing::Synthetic(at) => at,
         }
     }
 }
@@ -970,8 +1141,11 @@ fn hand_out_resource(
     }
     #[cfg(not(windows))]
     let _ = (state, clear);
+    // SAFETY: the caller supplies the same five-word clear value formerly
+    // read by host_texture at creation. Own it before the call returns.
     #[cfg(windows)]
-    let host = host_texture(&desc, state, clear);
+    let initial_clear = (desc.dimension != BUFFER && !clear.is_null())
+        .then(|| unsafe { clear.cast::<[u32; 5]>().read_unaligned() });
     let resource = Box::new(Resource {
         object: Object::new(&RESOURCE_FUNCTIONS),
         desc,
@@ -979,13 +1153,11 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host: host.map(|texture| {
-            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
-            std::sync::Arc::new(HostTexture {
-                texture,
-                state: state.into(),
-            })
-        }),
+        host: std::sync::OnceLock::new(),
+        #[cfg(windows)]
+        initial_state: state,
+        #[cfg(windows)]
+        initial_clear,
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -1001,7 +1173,8 @@ impl Drop for Resource {
         #[cfg(feature = "diagnostics")]
         if self
             .host
-            .as_ref()
+            .get()
+            .and_then(Option::as_ref)
             .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
         {
             // Before lists held their textures, this freed a texture that
@@ -1204,10 +1377,14 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     let mut out = std::ptr::null();
-    let made = create_at_address(
-        std::ptr::null(),
-        address,
-        &d,
+    if address == 0 {
+        return None;
+    }
+    let made = hand_out_resource(
+        d,
+        HeapProperties { kind: 1, cpu_pages: 0, pool: 0, creation_nodes: 1, visible_nodes: 1 },
+        0,
+        Backing::Synthetic(address as *mut u8),
         0,
         std::ptr::null(),
         &RESOURCE_IIDS[0],
@@ -1217,7 +1394,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
         return None;
     }
     map.insert((address, *desc), out as usize);
-    resource(out).host.is_some().then_some(out)
+    resource(out).host_texture_copy().is_some().then_some(out)
 }
 
 pub(crate) extern "system" fn create_placed(
@@ -1348,6 +1525,8 @@ extern "system" fn gpu_address(this: This) -> u64 {
             Backing::Committed(ref m) => format!("committed, attributes {:?}", m.attributes),
             Backing::Placed { offset, .. } => format!("placed in a heap at {offset:#x}"),
             Backing::Address(_) => "at a title address".into(),
+            #[cfg(windows)]
+            Backing::Synthetic(_) => "synthetic cached texture".into(),
         };
         ONCE[usize::from(r.desc.dimension == BUFFER)].call_once(|| {
             tracing::warn!(address = format_args!("{at:#x}"), backing, desc = ?r.desc, "a GPU address above 40 bits")

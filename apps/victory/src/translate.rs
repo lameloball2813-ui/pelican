@@ -336,13 +336,21 @@ fn translate(
     };
     for p in programs {
         t.programs += 1;
-        match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
-            Ok(program) => {
+        match victory_shader::range::build(&p.patched_code(), p.wave64, p.vgprs) {
+            Ok((mut program, mut structured)) => {
+                // Match victory_shader::emit::translate: normalize proven
+                // Xbox spilled user-data table loads before tracing their
+                // resource provenance. The diagnostic CLI must measure the
+                // exact runtime translation instead of the unrewritten IR.
+                if victory_shader::spill::is_spilled(&p)
+                    && victory_shader::spill::user_data(&mut program, &p) != 0
+                {
+                    structured = victory_shader::structure::structure(&program);
+                }
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
                 // Per-lane descriptors are traced on the per-lane form; its
                 // failure is listed after the resources' and I/O's.
-                let structured = structure::structure(&program);
                 let lanes = structured.as_ref().ok();
                 let res = match resource::track(&program, &p.layout, p.stage, lanes) {
                     Ok(r) => {

@@ -15,6 +15,7 @@
 //! operand's whole possible range: from the encoded register up to the
 //! program's VGPR count, all read (and all written, for a destination).
 
+use std::collections::HashMap;
 use crate::ShaderError;
 use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
 
@@ -123,6 +124,11 @@ impl Inst {
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
 pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
+    build_bounded(code, wave64, vgprs, &HashMap::new())
+}
+
+/// Build with certified upper bounds on the index of supported relative VGPR moves.
+pub(crate) fn build_bounded(code: &[u8], wave64: bool, vgprs: u16, m0_max: &HashMap<usize, u8>) -> Result<Program, ShaderError> {
     let list = gfx10::decode(code)?;
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
@@ -185,7 +191,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
                 Flow::Stop => Exit::End,
             };
         }
-        if let Some((mut reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
+        if let Some((mut reads, writes)) = effects(&machine, &fields, name, lanes, vgprs, m0_max.get(&machine.offset).copied())? {
             // Lanes disabled in EXEC keep the old value.
             for w in writes.iter().filter(|w| matches!(w, Reg::V(_))) {
                 if !reads.contains(w) {
@@ -672,10 +678,10 @@ type Effects = (Vec<Reg>, Vec<Reg>);
 /// value of a VGPR it only writes.
 pub(crate) fn operand_reads(p: &Program, inst: &Inst) -> Vec<Reg> {
     let lanes = 1 + u8::from(p.wave64);
-    effects(&inst.machine, &inst.fields, inst.name(), lanes, p.vgprs)
+    effects(&inst.machine, &inst.fields, inst.name(), lanes, p.vgprs, None)
         .ok()
         .flatten()
-        .map_or_else(Vec::new, |e| e.0)
+        .map_or_else(Vec::new, |e| e.0.into_iter().filter(|r| inst.read(*r).is_some()).collect())
 }
 
 /// Registers an instruction reads and writes, one per dword, or `None` if
@@ -686,6 +692,7 @@ fn effects(
     name: &'static str,
     lanes: u8,
     vgprs: u16,
+    m0_max: Option<u8>,
 ) -> Result<Option<Effects>, ShaderError> {
     if DROPPED.contains(&name) {
         return Ok(None);
@@ -828,7 +835,8 @@ fn effects(
             // v[reg + M0] for any M0 that stays inside the program's VGPRs.
             let indexed = |op: &Operand, out: &mut Vec<Reg>| match *op {
                 Operand::Vector { reg, .. } if u16::from(reg) < vgprs => {
-                    out.extend((u16::from(reg)..vgprs).map(|r| Reg::V(r as u8)));
+                    let end = m0_max.map_or(vgprs, |m| vgprs.min(u16::from(reg) + u16::from(m) + 1));
+                    out.extend((u16::from(reg)..end).map(|r| Reg::V(r as u8)));
                     Ok(())
                 }
                 _ => Err(ShaderError::Isa {

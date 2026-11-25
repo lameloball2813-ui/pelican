@@ -484,7 +484,12 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
+        // A diagnostic key script is a deliberate stand-in pad even when a
+        // physical XInput device is connected. Otherwise the launch harness
+        // silently loses its scripted A/Enter presses whenever Windows sees
+        // any controller. Normal keyboard fallback still needs an empty pad
+        // set; real pads remain separately reported and never overwritten.
+        let fallback = (stand_in_active(any_pad, diagnostic_pad_script())).then(|| Value::Pad(fallback(&keys)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -534,6 +539,23 @@ impl State {
             );
         }
     }
+}
+
+/// With diagnostics disabled, the stand-in follows real-controller presence.
+/// An explicitly scheduled test controller must also remain present while
+/// physical XInput devices are attached, including between scripted pulses.
+fn stand_in_active(any_real_pad: bool, script: bool) -> bool {
+    !any_real_pad || script
+}
+
+fn diagnostic_pad_script() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static SCRIPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *SCRIPT.get_or_init(|| std::env::var_os("VICTORY_KEYS").is_some_and(|v| !v.is_empty()))
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    { false }
 }
 
 #[cfg(windows)]
@@ -1434,6 +1456,22 @@ mod tests {
             virtual_key,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn scripted_stand_in_remains_available_beside_real_gamepad() {
+        assert!(stand_in_active(false, false));
+        assert!(stand_in_active(false, true));
+        assert!(stand_in_active(true, true));
+        assert!(!stand_in_active(true, false));
+        // The scripted virtual pad must retain its own A edge without
+        // modifying a real controller's buttons or keyboard key report.
+        let keys = vec![key(0x0D)];
+        let virtual_pad = fallback(&keys);
+        let physical_pad = PadState { buttons: B, ..Default::default() };
+        assert_eq!(virtual_pad.buttons, A);
+        assert_eq!(physical_pad.buttons, B);
+        assert_eq!(fallback(&[]).buttons, 0);
     }
 
     fn slot<F: Copy, T>(object: *const T, offset: usize) -> F {

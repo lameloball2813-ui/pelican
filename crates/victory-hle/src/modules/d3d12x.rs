@@ -20,6 +20,10 @@ extern "system" fn create_device(
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     #[cfg(windows)]
+    victory_gpu::use_physical_reader(super::xmem::read_physical_alias);
+    #[cfg(windows)]
+    victory_gpu::use_physical_writer(super::xmem::write_physical_alias_runs);
+    #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)
 }
@@ -47,6 +51,11 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     }
     #[cfg(not(windows))]
     let _ = dir;
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn diagnostic_memory() {
+    victory_gpu::diagnostic_memory();
 }
 
 pub(crate) fn module() -> HleModule {

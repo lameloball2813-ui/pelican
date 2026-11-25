@@ -30,6 +30,8 @@ pub mod frame;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod card_scan;
+#[cfg(windows)]
 mod indirect;
 pub mod list;
 pub mod object;
@@ -51,9 +53,15 @@ mod switch;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod texture_heap;
+#[cfg(windows)]
+mod twin;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{on_failure, use_physical_reader, use_physical_writer};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use host::diagnostic_memory;
 #[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+pub use watch::{title_memory_remapped, title_physical_view, physical_write, PhysicalWrite, begin_kernel_write, KernelWrite, writing as kernel_will_write};

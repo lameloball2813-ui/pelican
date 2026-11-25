@@ -37,8 +37,35 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
+    /// GPU→title buffer writeback, split into its expensive CPU phases.
+    BackPieces,
+    BackChanged,
+    BackScanUs,
+    BackReadUs,
+    BackMergeUs,
+    BackWriteUs,
+    BackGuardUs,
+    BackKernelWriteUs,
+    SnapshotUs,
+    SnapshotBytes,
+    RefreshUs,
+    ReadFallbackUs,
+    RegionQueries,
+    RegionQueryUs,
+    PhysicalReadBytes,
+    PhysicalReadUs,
+    PhysicalWriteBytes,
+    PhysicalWriteUs,
+    PhysicalWriteRuns,
+    BackKernelWriteRuns,
+    CardUploadBytes,
+    CardDownloadBytes,
+    CardUploadCopies,
+    CardDownloadCopies,
+    CardComparedBytes,
+    CardUnchangedBytes,
 }
-const COUNTERS: usize = 22;
+const COUNTERS: usize = C::CardUnchangedBytes as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -55,20 +82,38 @@ pub(crate) fn mode() -> u8 {
     })
 }
 
-/// Per source range (start, length): copies, bytes, microseconds, memory type.
-type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32)>;
+/// Per source range: requests, requested bytes, actual refreshed bytes, time.
+type Ranges = HashMap<(usize, usize), (u64, u64, u64, u64)>;
 static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
 
-/// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
-pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
+/// Per shader, time and slots visited in conservative bindless buffer scans.
+/// This separates command-recording work from submission refresh/copy costs.
+static HEAP_SCANS: Mutex<Option<HashMap<String, (u64, u64, u64, u64)>>> = Mutex::new(None);
+
+pub(crate) fn heap_scan(hash: &str, visited: u64, prepared: u64, us: u64) {
+    let mut held = HEAP_SCANS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = held.get_or_insert_with(HashMap::new);
+    if let Some(e) = map.get_mut(hash) {
+        e.0 += 1;
+        e.1 += visited;
+        e.2 += prepared;
+        e.3 += us;
+    } else {
+        map.insert(hash.to_owned(), (1, visited, prepared, us));
+    }
+}
+
+/// A request for `len` bytes refreshed only `copied` bytes after tracking.
+pub(crate) fn range(src: usize, len: usize, copied: usize, us: u64) {
     let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
     let e = map
         .get_or_insert_with(HashMap::new)
         .entry((src, len))
-        .or_insert((0, 0, 0, kind));
+        .or_insert((0, 0, 0, 0));
     e.0 += 1;
     e.1 += len as u64;
-    e.2 += us;
+    e.2 += copied as u64;
+    e.3 += us;
 }
 
 fn page_faults() -> u64 {
@@ -127,10 +172,41 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
     );
+    tracing::info!(
+        "GPU writeback per frame: {:.0} pieces, {:.0} changed; {:.1} ms scanning, {:.1} ms reading title memory, {:.1} ms merging, {:.1} ms writing title memory ({:.1} ms guards, {:.1} ms kernel writes)",
+        c[C::BackPieces as usize],
+        c[C::BackChanged as usize],
+        ms(c[C::BackScanUs as usize]),
+        ms(c[C::BackReadUs as usize]),
+        ms(c[C::BackMergeUs as usize]),
+        ms(c[C::BackWriteUs as usize]),
+        ms(c[C::BackGuardUs as usize]),
+        ms(c[C::BackKernelWriteUs as usize]),
+    );
+    tracing::info!(
+        "buffer phases per frame: {:.1} ms refresh, {:.1} ms snapshots ({:.1} MB copied), {:.1} ms failed-read fallback, {:.0} region queries {:.1} ms",
+        ms(c[C::RefreshUs as usize]), ms(c[C::SnapshotUs as usize]),
+        mb(c[C::SnapshotBytes as usize]), ms(c[C::ReadFallbackUs as usize]),
+        c[C::RegionQueries as usize], ms(c[C::RegionQueryUs as usize]),
+    );
+    tracing::info!("stable physical alias reads per frame: {:.1} MB, {:.1} ms", mb(c[C::PhysicalReadBytes as usize]), ms(c[C::PhysicalReadUs as usize]));
+    tracing::info!("stable physical alias writes per frame: {:.1} MB, {:.1} ms, {:.0} runs; kernel fallback {:.0} runs", mb(c[C::PhysicalWriteBytes as usize]), ms(c[C::PhysicalWriteUs as usize]), c[C::PhysicalWriteRuns as usize], c[C::BackKernelWriteRuns as usize]);
+    tracing::info!("VRAM shadow transfers per frame: {:.2} MB up ({:.1} copies), {:.2} MB down ({:.1} copies); {:.1} MB live card backing", mb(c[C::CardUploadBytes as usize]), c[C::CardUploadCopies as usize], mb(c[C::CardDownloadBytes as usize]), c[C::CardDownloadCopies as usize], mb(crate::shadow::card_bytes() as f64));
+    tracing::info!("exact GPU comparisons per frame: {:.2} MB scanned on card, {:.2} MB unchanged (CPU scan omitted)", mb(c[C::CardComparedBytes as usize]), mb(c[C::CardUnchangedBytes as usize]));
+    let scans = HEAP_SCANS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut scans: Vec<_> = scans.into_iter().flatten().collect();
+    let totals = scans.iter().fold((0, 0, 0, 0), |a, (_, b)| (a.0+b.0, a.1+b.1, a.2+b.2, a.3+b.3));
+    if totals.0 != 0 {
+        tracing::info!("heap scans per frame: {:.1} calls, {:.0} visited, {:.0} prepared, {:.1} ms recording", totals.0 as f64 / frames, totals.1 as f64 / frames, totals.2 as f64 / frames, ms(totals.3 as f64 / frames));
+        scans.sort_unstable_by_key(|(_, e)| std::cmp::Reverse(e.3));
+        for (hash, (calls, slots, prepared, us)) in scans.into_iter().take(8) {
+            tracing::info!("  heap scan shader {hash}: {:.1} calls/frame, {:.0} slots/frame, {:.0} prepared/frame, {:.1} ms/frame", calls as f64 / frames, slots as f64 / frames, prepared as f64 / frames, ms(us as f64 / frames));
+        }
+    }
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
-    ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
-    for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
+    ranges.sort_by_key(|&(_, (_, _, copied, us))| std::cmp::Reverse((us, copied)));
+    for ((src, len), (n, requested, copied, us)) in ranges.into_iter().take(12) {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -138,9 +214,10 @@ pub(crate) fn log(frames: f64) {
         unsafe { VirtualQuery(src as *const _, &mut info, size_of_val(&info)) };
         let kind = info.Type;
         tracing::info!(
-            "  copied from {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame",
+            "  refreshed {src:#x}+{len:#x} (memory {kind:#x}): {:.1}x/frame, {:.2} MB requested, {:.2} MB actual, {:.2} ms/frame",
             n as f64 / frames,
-            bytes as f64 / 1e6 / frames,
+            requested as f64 / 1e6 / frames,
+            copied as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
         );
     }

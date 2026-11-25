@@ -357,6 +357,10 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
         2 => Some(Barrier {
             first: if b.first.is_null() {
                 b.first
+            } else if crate::resource::d16_twin_candidate(b.first) {
+                // An explicit UAV barrier on the original depth object
+                // must also order writes to its actual writable twin.
+                std::ptr::null()
             } else {
                 host(b.first)?
             },
@@ -417,6 +421,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
 #[cfg(windows)]
 pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
+    if crate::twin::depth_use(list, resource, state) {
+        return;
+    }
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));

@@ -68,6 +68,12 @@ impl Host {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
+            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+                let mut debug: Option<ID3D12Debug> = None;
+                if D3D12GetDebugInterface(&mut debug).is_ok() {
+                    if let Some(debug) = debug { debug.EnableDebugLayer(); }
+                }
+            }
             let mut device: Option<ID3D12Device> = None;
             if warp {
                 let factory: IDXGIFactory4 =
@@ -132,21 +138,22 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        let mut views: Vec<(u8, bool)> = stages
+        let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
-                cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
+                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0u8));
+                cbvs.chain(s.root_srvs.iter().map(|&r| (r, 1u8)))
+                    .chain(s.root_uavs.iter().map(|&r| (r, 2u8)))
             })
             .collect();
         views.sort_unstable();
         views.dedup();
-        for (slot, srv) in views {
+        for (slot, kind) in views {
             params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: if srv {
-                    D3D12_ROOT_PARAMETER_TYPE_SRV
-                } else {
-                    D3D12_ROOT_PARAMETER_TYPE_CBV
+                ParameterType: match kind {
+                    0 => D3D12_ROOT_PARAMETER_TYPE_CBV,
+                    1 => D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    _ => D3D12_ROOT_PARAMETER_TYPE_UAV,
                 },
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
@@ -233,7 +240,33 @@ impl Host {
             ..Default::default()
         };
         // SAFETY: the description points at live data.
-        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(err)
+        unsafe { self.device.CreateComputePipelineState(&desc) }.map_err(|error| self.explained(error))
+    }
+
+    /// Include D3D12's diagnostics when the GPU accepts the DXIL container
+    /// but refuses its pipeline requirements. The plain HRESULT omits the
+    /// feature/root-layout violation that distinguishes these shaders.
+    fn explained(&self, error: windows::core::Error) -> String {
+        let mut reason = err(error);
+        let Ok(queue) = self.device.cast::<ID3D12InfoQueue>() else { return reason };
+        // SAFETY: allocate the exact message size, aligned for the header.
+        unsafe {
+            for i in 0..queue.GetNumStoredMessages() {
+                let mut bytes = 0usize;
+                let _ = queue.GetMessage(i, None, &mut bytes);
+                let mut data = vec![0u64; bytes.div_ceil(8)];
+                let msg = data.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if queue.GetMessage(i, Some(msg), &mut bytes).is_ok() {
+                    let m = &*msg;
+                    let description = std::slice::from_raw_parts(m.pDescription,
+                        m.DescriptionByteLength.saturating_sub(1));
+                    reason.push_str(" | ");
+                    reason.push_str(&String::from_utf8_lossy(description));
+                }
+            }
+            queue.ClearStoredMessages();
+        }
+        reason
     }
 
     /// A graphics pipeline from a vertex and a pixel shader, with float or
@@ -254,6 +287,16 @@ impl Host {
         &self,
         root: &ID3D12RootSignature,
         vs: &[u8],
+        ps: &[u8],
+    ) -> Result<ID3D12PipelineState, String> {
+        self.pipeline_with_gs(root, vs, None, ps)
+    }
+
+    pub fn pipeline_with_gs(
+        &self,
+        root: &ID3D12RootSignature,
+        vs: &[u8],
+        gs: Option<&[u8]>,
         ps: &[u8],
     ) -> Result<ID3D12PipelineState, String> {
         let inputs = sig(vs, FourCC::ISG1)?;
@@ -287,6 +330,9 @@ impl Host {
                 pShaderBytecode: ps.as_ptr().cast(),
                 BytecodeLength: ps.len(),
             },
+            GS: gs.map_or(D3D12_SHADER_BYTECODE::default(), |g| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: g.as_ptr().cast(), BytecodeLength: g.len(),
+            }),
             SampleMask: u32::MAX,
             RasterizerState: D3D12_RASTERIZER_DESC {
                 FillMode: D3D12_FILL_MODE_SOLID,
@@ -528,6 +574,10 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        root_uavs: Vec::new(),
+        static_table_cbvs: Vec::new(),
+        heap_buffer_classes: 0,
+        heap_demands: Vec::new(),
     }
 }
 
@@ -546,6 +596,9 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// GPU-writeable root UAV whose initialized contents are read back after
+    /// the dispatch, alongside heap UAVs.
+    Uav(Vec<u32>),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -783,7 +836,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1317,6 +1370,23 @@ impl Host {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
+                    }
+                    Root::Uav(data) => {
+                        let bytes = (data.len() * 4) as u64;
+                        let b = make(D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COPY_DEST)?;
+                        let initial = upload(data)?;
+                        list.CopyBufferRegion(&b, 0, &initial, 0, bytes);
+                        list.ResourceBarrier(&[transition(&b,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
+                        let rb = make(D3D12_HEAP_TYPE_READBACK,
+                            &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST)?;
+                        uavs.push((b, None, data.len() as u32, rb));
+                        keep.push(initial);
                     }
                 }
             }

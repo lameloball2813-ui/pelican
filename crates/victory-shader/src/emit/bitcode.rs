@@ -215,6 +215,47 @@ pub(crate) struct Module {
 }
 
 impl Module {
+    /// Extract an exact bounded expression from the emitted LLVM value,
+    /// not from guesses about the console descriptor or its native SSA.
+    /// Any memory load other than our actual root constants, control-flow
+    /// value, dynamic shift with undefined behavior, etc. falls back.
+    pub(crate) fn heap_index_code(&self, value: V, user: Option<V>) -> Option<Vec<u32>> {
+        fn walk(m: &Module, value: V, user: Option<V>, out: &mut Vec<u32>, fuel: &mut usize) -> Option<()> {
+            *fuel = fuel.checked_sub(1)?;
+            if m.types[m.type_of(value).0 as usize] != TypeDef::Int(32) { return None; }
+            if let Some(k) = m.as_i32(value) {
+                out.extend([0, k as u32]);
+                return Some(());
+            }
+            let V::Inst(i) = value else { return None; };
+            match &m.insts.get(i as usize)?.op {
+                Op::Extract(V::Inst(load), component) if *component < 4 => {
+                    let Op::Call(f, args) = &m.insts.get(*load as usize)?.op else { return None; };
+                    let [opcode, handle, row] = args.as_slice() else { return None; };
+                    if Some(*handle) != user || m.as_i32(*opcode) != Some(59)
+                        || m.funcs.get(*f as usize)?.name != "dx.op.cbufferLoadLegacy.i32" { return None; }
+                    let row = u32::try_from(m.as_i32(*row)?).ok()?;
+                    out.extend([1, row.checked_mul(4)?.checked_add(*component)?]);
+                }
+                Op::Bin(op, a, b) => {
+                    let code = match op {
+                        Bin::Add => 2, Bin::Sub => 3, Bin::Mul => 4,
+                        Bin::Shl => 5, Bin::LShr => 6, Bin::And => 7,
+                        Bin::Or => 8, Bin::Xor => 9, _ => return None,
+                    };
+                    walk(m, *a, user, out, fuel)?;
+                    walk(m, *b, user, out, fuel)?;
+                    out.extend([code, 0]);
+                }
+                _ => return None,
+            }
+            Some(())
+        }
+        let mut out = Vec::new();
+        walk(self, value, user, &mut out, &mut 24)?;
+        Some(out)
+    }
+
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);

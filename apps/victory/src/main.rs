@@ -9,6 +9,8 @@ mod inspect;
 mod run;
 mod shader;
 mod translate;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod memory_accounting;
 
 use std::path::PathBuf;
 
@@ -161,7 +163,11 @@ fn main() -> Result<()> {
             execute,
             console,
             title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+        } => {
+            #[cfg(all(windows, feature = "diagnostics"))]
+            if execute { memory_accounting::start(); }
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
         Command::Config => show_config(),
     }
 }

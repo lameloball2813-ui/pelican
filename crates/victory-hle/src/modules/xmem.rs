@@ -485,7 +485,93 @@ const PAGE: usize = 64 << 10;
 
 struct Section {
     handle: HANDLE,
+    id: usize,
     gpu_optimal: bool,
+    /// Runtime-owned read-only alias of the same pagefile backing.
+    bytes: usize,
+    read_alias: std::sync::OnceLock<Option<ReadAlias>>,
+    write_alias: std::sync::OnceLock<Option<ReadAlias>>,
+    /// Physical section pages committed through any of their aliases.
+    /// Diagnostics only: never influence the title's address/contents.
+    #[cfg(feature = "diagnostics")]
+    committed: Mutex<Vec<bool>>,
+}
+
+/// Stable read-only section mapping. Once a reserved section page is
+/// committed it cannot be decommitted individually. Verify readable pages
+/// before their first use; never dereference the title's remappable VA.
+struct ReadAlias {
+    base: usize,
+    protection: u32,
+    verified: Mutex<Vec<bool>>,
+}
+
+impl Drop for ReadAlias {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.base as *mut c_void }); }
+    }
+}
+
+impl ReadAlias {
+    fn new(section: &Section, writable: bool) -> Option<Self> {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_READONLY, PAGE_READWRITE};
+        let access = if writable { FILE_MAP_WRITE } else { FILE_MAP_READ };
+        let view = unsafe { MapViewOfFile(section.handle, access, 0, 0, section.bytes) };
+        if view.Value.is_null() { return None; }
+        Some(Self { base: view.Value as usize, protection: if writable { PAGE_READWRITE } else { PAGE_READONLY }, verified: Mutex::new(vec![false; section.bytes / PAGE]) })
+    }
+
+    fn checked(&self, offset: usize, len: usize) -> Option<usize> {
+        use windows_sys::Win32::System::Memory::VirtualQuery;
+        let end = offset.checked_add(len)?;
+        let mut verified = self.verified.lock().unwrap_or_else(|e| e.into_inner());
+        let last = end.div_ceil(PAGE);
+        if last > verified.len() { return None; }
+        let mut page = offset / PAGE;
+        while page < last {
+            if verified[page] { page += 1; continue; }
+            let at = self.base + page * PAGE;
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe { VirtualQuery(at as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0
+                || info.State != MEM_COMMIT || info.Protect != self.protection
+                || info.AllocationBase as usize != self.base { return None; }
+            let end = (info.BaseAddress as usize).checked_add(info.RegionSize)?;
+            let next = ((end.checked_sub(self.base)?) / PAGE).min(verified.len());
+            if next <= page { return None; }
+            verified[page..next].fill(true);
+            page = next;
+        }
+        self.base.checked_add(offset)
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static PHYSICAL_COMMITTED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+impl Section {
+    /// A slice mapped at more than one address still consumes one set of
+    /// section pages; count each committed page only once.
+    #[cfg(feature = "diagnostics")]
+    fn note_committed(&self, first: usize, count: usize) {
+        let mut pages = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(bits) = pages.get_mut(first..first.saturating_add(count)) else { return };
+        let newly = bits.iter().filter(|&&b| !b).count();
+        bits.fill(true);
+        if newly > 0 {
+            let bytes = newly * PAGE;
+            let before = PHYSICAL_COMMITTED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+            let after = before + bytes;
+            const STEP: usize = 512 << 20;
+            if before / STEP != after / STEP {
+                tracing::info!(
+                    physical_section_committed_mb = after / MIB,
+                    newly_mb = bytes / MIB,
+                    "unique physical section pages committed"
+                );
+            }
+        }
+    }
 }
 
 // SAFETY: a section handle may be used from any thread.
@@ -495,6 +581,13 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        {
+            let committed = self.committed.lock().unwrap_or_else(|e| e.into_inner());
+            let bytes = committed.iter().filter(|&&b| b).count() * PAGE;
+            saturating_sub(&PHYSICAL_COMMITTED_BYTES, bytes);
+            tracing::debug!(bytes, "physical section released");
+        }
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.handle) };
     }
@@ -527,6 +620,107 @@ static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
 
 fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Read through the runtime's stable section views rather than probing
+/// title memory in the kernel for every buffer refresh. Only a fully
+/// covered physical range is accepted. The mapping lock prevents the
+/// source identity from changing mid-copy. Ordinary/unmapped addresses
+/// retain the existing kernel-validated path.
+/// # Safety
+/// `dst` must name an independent writable host allocation of `len` bytes.
+pub unsafe fn read_physical_alias(dst: *mut u8, src: *const u8, len: usize) -> bool {
+    #[cfg(not(target_arch = "x86_64"))]
+    { let _ = (dst, src, len); false }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let start = src as usize;
+        let Some(end) = start.checked_add(len) else { return false; };
+        let p = physical();
+        let mut at = start;
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        while at < end {
+            let Some((&base, (size, slice))) = p.views.range(..=at).next_back() else { return false; };
+            let Some(boundary) = base.checked_add(*size) else { return false; };
+            if at >= boundary { return false; }
+            let n = (end - at).min(boundary - at);
+            let Some(offset) = slice.index.checked_mul(PAGE).and_then(|v| v.checked_add(at - base)) else { return false; };
+            let Some(alias) = slice.section.read_alias.get_or_init(|| ReadAlias::new(&slice.section, false)).as_ref() else { return false; };
+            let Some(source) = alias.checked(offset, n) else { return false; };
+            if let Some((previous, bytes)) = runs.last_mut() {
+                if previous.checked_add(*bytes) == Some(source) {
+                    *bytes += n;
+                    at += n;
+                    continue;
+                }
+            }
+            runs.push((source, n));
+            at += n;
+        }
+        let mut offset = 0;
+        for (source, bytes) in runs {
+            // SAFETY: these are verified readable runtime-owned mappings,
+            // alive and mapped throughout the copy. The destination is a
+            // separate host buffer. Use a machine copy of foreign shared
+            // memory, not Rust references to title-mutated bytes.
+            unsafe {
+                core::arch::asm!("cld", "rep movsb",
+                    inout("rsi") source => _,
+                    inout("rdi") dst.add(offset) => _,
+                    inout("rcx") bytes => _, options(nostack));
+            }
+            offset += bytes;
+        }
+        true
+    }
+}
+
+/// Scatter only GPU-modified bytes through a stable physical section alias.
+/// The caller must hold the title write guard; failure writes nothing.
+/// # Safety
+/// `src` is independent host memory, and `dst` names the intended title span.
+pub unsafe fn write_physical_alias_runs(dst: *mut u8, src: &[u8], runs: &[(usize, usize)]) -> bool {
+    #[cfg(not(target_arch = "x86_64"))]
+    { let _ = (dst, src, runs); false }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use windows_sys::Win32::System::Memory::{MEM_MAPPED, PAGE_READWRITE, VirtualQuery};
+        let (Some(&(first, _)), Some(&(_, last))) = (runs.first(), runs.last()) else { return false; };
+        if first >= last || runs.iter().any(|&(a,b)| a >= b || b > src.len()) || runs.windows(2).any(|p| p[0].1 > p[1].0) { return false; }
+        let (Some(start), Some(end)) = ((dst as usize).checked_add(first), (dst as usize).checked_add(last)) else { return false; };
+        if start / PAGE != (end - 1) / PAGE { return false; }
+        let p = physical();
+        let Some((&base, (size, slice))) = p.views.range(..=start).next_back() else { return false; };
+        if base.checked_add(*size).is_none_or(|limit| end > limit) { return false; }
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(start as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0
+            || info.State != MEM_COMMIT || info.Type != MEM_MAPPED || info.Protect != PAGE_READWRITE
+            || info.AllocationBase as usize != base
+            || (info.BaseAddress as usize).checked_add(info.RegionSize).is_none_or(|limit| end > limit) { return false; }
+        let Some(offset) = slice.index.checked_mul(PAGE).and_then(|v| v.checked_add(start - base)) else { return false; };
+        let Some(alias) = slice.section.write_alias.get_or_init(|| ReadAlias::new(&slice.section, true)).as_ref() else { return false; };
+        let Some(target) = alias.checked(offset, end - start) else { return false; };
+        let _active = victory_gpu::physical_write(slice.section.id, offset / PAGE, 1);
+        for &(a,b) in runs {
+            // SAFETY: the section and its verified alias remain mapped under
+            // the physical lock. Do not create Rust references to title memory.
+            unsafe {
+                let from = src.as_ptr().add(a);
+                let to = target + a - first;
+                // Sparse GPU writes commonly change just one or two bytes.
+                // Do not pay REP startup cost for these tiny runs, nor widen
+                // them into a store that overwrites a concurrent title write.
+                match b - a {
+                    1 => core::arch::asm!("mov al, byte ptr [{s}]", "mov byte ptr [{d}], al", s = in(reg) from, d = in(reg) to, out("rax") _, options(nostack, preserves_flags)),
+                    2 => core::arch::asm!("mov ax, word ptr [{s}]", "mov word ptr [{d}], ax", s = in(reg) from, d = in(reg) to, out("rax") _, options(nostack, preserves_flags)),
+                    4 => core::arch::asm!("mov eax, dword ptr [{s}]", "mov dword ptr [{d}], eax", s = in(reg) from, d = in(reg) to, out("rax") _, options(nostack, preserves_flags)),
+                    8 => core::arch::asm!("mov rax, qword ptr [{s}]", "mov qword ptr [{d}], rax", s = in(reg) from, d = in(reg) to, out("rax") _, options(nostack, preserves_flags)),
+                    n => core::arch::asm!("cld", "rep movsb", inout("rsi") from => _, inout("rdi") to => _, inout("rcx") n => _, options(nostack)),
+                }
+            }
+        }
+        true
+    }
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
@@ -574,10 +768,22 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         "XMemAllocatePhysicalPages"
     );
     let gpu_optimal = flags & GRAPHICS != 0;
+    static NEXT_SECTION_ID: AtomicUsize = AtomicUsize::new(1);
     let section = Arc::new(Section {
         handle,
+        id: NEXT_SECTION_ID.fetch_add(1, Ordering::Relaxed),
         gpu_optimal,
+        bytes: size,
+        read_alias: std::sync::OnceLock::new(),
+        write_alias: std::sync::OnceLock::new(),
+        #[cfg(feature = "diagnostics")]
+        committed: Mutex::new(vec![on_wine(); n]),
     });
+    #[cfg(feature = "diagnostics")]
+    if on_wine() {
+        PHYSICAL_COMMITTED_BYTES.fetch_add(size, Ordering::Relaxed);
+    }
+    tracing::debug!(size, n, gpu_optimal, "physical section reserved");
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -624,6 +830,7 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
 struct View {
     at: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
+    _write: victory_gpu::PhysicalWrite,
 }
 
 impl View {
@@ -644,8 +851,12 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        let view = View { at, len, _write: victory_gpu::physical_write(slice.section.id, slice.index, n) };
+        if commit(at.Value as usize, len) {
+            #[cfg(feature = "diagnostics")]
+            slice.section.note_committed(slice.index, n);
+            Some(view)
+        } else { None }
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -815,30 +1026,60 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
 /// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`): Grand Theft Auto
 /// VI maps pages into a pool view, then has the GPU map them into its tiled
-/// heap. Page by page; false if a source page is not mapped physical memory.
+/// heap. Resolve the source before replacing the destination: overlapping
+/// aliases and repeated identical mappings must not destroy their source
+/// or invalidate copies of pages that did not actually change.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    if len == 0 { return true; }
+    if to % PAGE != 0 || from % PAGE != 0 || len % PAGE != 0
+        || to.checked_add(len).is_none() || from.checked_add(len).is_none() {
+        return false;
+    }
     let mut physical = physical();
-    unmap(&mut physical, to, len);
+    if from == 0 {
+        unmap(&mut physical, to, len);
+        return !physical.views.range(..to + len).next_back()
+            .is_some_and(|(&base, (size, _))| base + size > to);
+    }
+    let at = |p: &Physical, address: usize| -> Option<Slice> {
+        let (&base, (size, s)) = p.views.range(..=address).next_back()?;
+        (address < base + size).then(|| Slice {
+            index: s.index + (address - base) / PAGE,
+            section: s.section.clone(),
+        })
+    };
+    // Build runs of changed destination pages; unchanged mappings keep
+    // their views, protection and write generations. Group only physically
+    // consecutive source pages, never infer contiguity from virtual VA.
+    let mut changes: Vec<(usize, usize, Slice)> = Vec::new();
     for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
+        let Some(slice) = at(&physical, from + k) else { return false; };
+        if at(&physical, to + k).is_some_and(|old| {
+            Arc::ptr_eq(&old.section, &slice.section) && old.index == slice.index
+        }) { continue; }
+        if let Some((start, size, first)) = changes.last_mut() {
+            if *start + *size == to + k && Arc::ptr_eq(&first.section, &slice.section)
+                && first.index + *size / PAGE == slice.index {
+                *size += PAGE;
+                continue;
+            }
         }
-        let at = from + k;
-        let Some(slice) = physical
-            .views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
-            })
-        else {
-            return false;
-        };
-        if !map(&mut physical, to + k, PAGE, slice) {
-            return false;
+        changes.push((to + k, PAGE, slice));
+    }
+    for (base, size, slice) in changes {
+        unmap(&mut physical, base, size);
+        // Old page-at-a-time mappings may have left several adjacent
+        // placeholders. Try the grouped run first; if it does not fit one
+        // placeholder, the original page-at-a-time path is still valid.
+        if size == PAGE {
+            if !map(&mut physical, base, size, slice) { return false; }
+        } else if !map(&mut physical, base, size, slice.clone()) {
+            for k in (0..size).step_by(PAGE) {
+                if !map(&mut physical, base + k, PAGE, Slice {
+                    section: slice.section.clone(), index: slice.index + k / PAGE,
+                }) { return false; }
+            }
         }
     }
     true
@@ -882,8 +1123,10 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
+    #[cfg(feature = "diagnostics")]
+    slice.section.note_committed(slice.index, len / PAGE);
     // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
+    victory_gpu::title_physical_view(base, len, slice.section.id, slice.index);
     physical.views.insert(base, (len, slice));
     true
 }
@@ -962,9 +1205,8 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
-        victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
+        let unmapped = unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -972,7 +1214,13 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 },
                 MEM_PRESERVE_PLACEHOLDER,
             )
-        };
+        } != 0;
+        if !unmapped {
+            tracing::warn!(address = format_args!("{at:#x}"), size, error = %std::io::Error::last_os_error(), "physical view could not be unmapped");
+            physical.views.insert(at, (size, slice));
+            continue;
+        }
+        victory_gpu::title_memory_remapped(at, size);
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
@@ -1017,6 +1265,20 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     };
     let heap_total = HEAP_USED.load(Ordering::Relaxed);
     let heap_gpu = HEAP_GPU_OPTIMAL_USED.load(Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    {
+        static LAST_MEMORY_LOG: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let mut last = LAST_MEMORY_LOG.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        if last.is_none_or(|at| now.duration_since(at).as_secs() >= 1) {
+            *last = Some(now);
+            tracing::info!(virtual_committed_bytes = virt_total, virtual_gpu_bytes = virt_gpu,
+                heap_bytes = heap_total, heap_gpu_bytes = heap_gpu,
+                physical_allocated_bytes = phys_pages.saturating_mul(PAGE),
+                physical_committed_bytes = PHYSICAL_COMMITTED_BYTES.load(Ordering::Relaxed),
+                "title memory accounting (physical commitment distinct from private bytes)");
+        }
+    }
     let title_used = virt_total
         .saturating_add(phys_pages.saturating_mul(PAGE))
         .saturating_add(heap_total);
@@ -1035,6 +1297,20 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     // SAFETY: checked non-null; the title passes room for the structure.
     unsafe { out.write(stats) };
     1
+}
+
+/// Sample independently of whether the title requests working-set stats.
+/// Physical aliases must not be added again to private virtual commitment.
+#[cfg(feature = "diagnostics")]
+pub fn diagnostic_memory() {
+    let (virtual_committed_bytes, virtual_gpu_bytes) = virtual_used();
+    let physical_allocated_bytes = physical().pages.len().saturating_mul(PAGE);
+    tracing::info!(virtual_committed_bytes, virtual_gpu_bytes,
+        heap_bytes = HEAP_USED.load(Ordering::Relaxed),
+        heap_gpu_bytes = HEAP_GPU_OPTIMAL_USED.load(Ordering::Relaxed),
+        physical_allocated_bytes,
+        physical_committed_bytes = PHYSICAL_COMMITTED_BYTES.load(Ordering::Relaxed),
+        "periodic title memory accounting");
 }
 
 /// Hands title memory (standard, in 2 MiB pages) to the system. The other
@@ -1357,6 +1633,158 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    #[test]
+    fn gpu_alias_keeps_identical_pages_and_resolves_overlapping_sources() {
+        let pages = allocate(4);
+        let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE,
+            MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
+        let (a, b) = (reserve(), reserve());
+        assert!(a != 0 && b != 0);
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 4, pages.as_ptr()) as usize, a);
+        for i in 0..4 { unsafe { ((a + i * PAGE) as *mut u8).write((i + 1) as u8); } }
+        assert!(map_alias(b as u64, a as u64, (4 * PAGE) as u64));
+        let mappings = |base: usize| {
+            let p = physical();
+            p.views.range(base..base + 4 * PAGE).map(|(&at, (len, slice))|
+                (at, *len, slice.section.id, slice.index)).collect::<Vec<_>>()
+        };
+        let before = mappings(b);
+        assert_eq!(before.len(), 1, "consecutive source pages should share one view");
+        assert!(map_alias(b as u64, a as u64, (4 * PAGE) as u64));
+        assert_eq!(mappings(b), before);
+        assert!(map_alias((b + PAGE) as u64, b as u64, (3 * PAGE) as u64));
+        for (i, expected) in [1u8, 1, 2, 3].into_iter().enumerate() {
+            assert_eq!(unsafe { ((b + i * PAGE) as *const u8).read() }, expected);
+        }
+        // Both aliases must still see writes to their common section page.
+        unsafe { (a as *mut u8).write(0x9a); }
+        assert_eq!(unsafe { (b as *const u8).read() }, 0x9a);
+        assert_eq!(unsafe { ((b + PAGE) as *const u8).read() }, 0x9a);
+        assert!(map_alias(b as u64, 0, (4 * PAGE) as u64));
+        assert!(map_alias(a as u64, 0, (4 * PAGE) as u64));
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn stable_physical_reader_handles_late_commit_remap_and_holes() {
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE,
+            MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
+        assert_ne!(a, 0);
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 1, pages.as_ptr()) as usize, a);
+        unsafe { (a as *mut u8).write_bytes(0x31, PAGE); }
+        let mut data = vec![0u8; PAGE + 17];
+        let read = |data: &mut [u8], at: usize| unsafe {
+            read_physical_alias(data.as_mut_ptr(), at as *const u8, data.len())
+        };
+        assert!(read(&mut data[..37], a + 19));
+        assert_eq!(&data[..37], &[0x31; 37]);
+        // A previously uncommitted page becomes readable through the
+        // already-existing stable read alias after the title maps it.
+        assert!(!read(&mut data, a));
+        assert_eq!(XMemMapPhysicalPages((a + PAGE) as *mut c_void, 1, pages[1..].as_ptr()) as usize, a + PAGE);
+        unsafe { ((a + PAGE) as *mut u8).write_bytes(0x42, PAGE); }
+        assert!(read(&mut data, a + 9));
+        assert!(data[..PAGE - 9].iter().all(|&b| b == 0x31));
+        assert!(data[PAGE - 9..].iter().all(|&b| b == 0x42));
+        // Reassign the virtual page, not just its contents. The reader
+        // must resolve the current section offset on every refresh.
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 1, pages[2..].as_ptr()) as usize, a);
+        unsafe { (a as *mut u8).write_bytes(0x53, PAGE); }
+        assert!(read(&mut data, a));
+        assert!(data[..PAGE].iter().all(|&b| b == 0x53));
+        assert!(data[PAGE..].iter().all(|&b| b == 0x42));
+        assert!(map_alias(a as u64, 0, (3 * PAGE) as u64));
+        assert!(!read(&mut data[..37], a));
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn stable_physical_scatter_preserves_gaps_and_remaps() {
+        let pages = allocate(2);
+        let a = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
+        let b = XMemVirtualAlloc(std::ptr::null_mut(), PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
+        assert_ne!(a, 0);
+        assert_ne!(b, 0);
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 1, pages.as_ptr()) as usize, a);
+        assert!(map_alias(b as u64, a as u64, PAGE as u64));
+        unsafe { (a as *mut u8).write_bytes(0x31, PAGE); }
+        let src = vec![0x99; PAGE];
+        let runs: Vec<_> = (0..128).map(|i| {
+            let start = i * 33 + 1;
+            (start, start + [1, 2, 3, 4, 5, 8, 16, 31][i % 8])
+        }).chain(std::iter::once((PAGE - 1, PAGE))).collect();
+        let write = |at: usize, runs: &[(usize, usize)]| {
+            let _guard = victory_gpu::begin_kernel_write(at, PAGE, false);
+            unsafe { write_physical_alias_runs(at as *mut u8, &src, runs) }
+        };
+        assert!(write(a, &runs));
+        let mut actual = vec![0; PAGE];
+        assert!(unsafe { read_physical_alias(actual.as_mut_ptr(), b as *const u8, PAGE) });
+        let mut expected = vec![0x31; PAGE];
+        for &(lo, hi) in &runs { expected[lo..hi].fill(0x99); }
+        assert_eq!(actual, expected);
+        assert!(!write(a + PAGE - 2, &[(0, 1), (3, 4)]));
+        assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 1, pages[1..].as_ptr()) as usize, a);
+        unsafe { (a as *mut u8).write_bytes(0x42, PAGE); }
+        assert!(write(a, &runs));
+        assert_eq!(page_bytes(pages[0]), expected);
+        expected.fill(0x42);
+        for &(lo, hi) in &runs { expected[lo..hi].fill(0x99); }
+        assert_eq!(page_bytes(pages[1]), expected);
+        assert!(map_alias(a as u64, 0, PAGE as u64));
+        assert!(!write(a, &runs));
+        assert_eq!(page_bytes(pages[1]), expected);
+        assert!(map_alias(b as u64, 0, PAGE as u64));
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn physical_sparse_writer_handles_each_page_of_a_multiview_span() {
+        let pages = allocate(3);
+        let dst = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K,
+            0, PAGE_READWRITE) as usize;
+        assert_ne!(dst, 0);
+        assert_eq!(XMemMapPhysicalPages(dst as *mut c_void, 3, pages.as_ptr()) as usize, dst);
+        unsafe { (dst as *mut u8).write_bytes(0x42, 3 * PAGE); }
+        let src = vec![0xD7; 3 * PAGE];
+        let runs = [(PAGE - 7, PAGE + 5), (PAGE + 43, PAGE + 49),
+                    (2 * PAGE - 1, 2 * PAGE + 3), (3 * PAGE - 4, 3 * PAGE)];
+        let mut groups = Vec::new();
+        for (a,b) in runs {
+            let mut at = a;
+            while at < b {
+                let to = b.min((at / PAGE + 1) * PAGE);
+                if let Some(last) = groups.last_mut() {
+                    let last: &mut Vec<(usize,usize)> = last;
+                    if last.last().is_some_and(|&(_, end)| end / PAGE == at / PAGE && end < at) {
+                        last.push((at, to));
+                    } else { groups.push(vec![(at,to)]); }
+                } else { groups.push(vec![(at,to)]); }
+                at = to;
+            }
+        }
+        for group in &groups {
+            let _guard = victory_gpu::begin_kernel_write(dst + group[0].0,
+                group.last().unwrap().1 - group[0].0, false);
+            assert!(unsafe { write_physical_alias_runs(dst as *mut u8, &src, group) });
+        }
+        let mut expected = vec![0x42; 3 * PAGE];
+        for (a,b) in runs { expected[a..b].fill(0xD7); }
+        let mut actual = vec![0; 3 * PAGE];
+        assert!(unsafe { read_physical_alias(actual.as_mut_ptr(), dst as *const u8, 3 * PAGE) });
+        assert_eq!(actual, expected);
+        assert_eq!(XMemMapPhysicalPages((dst + PAGE) as *mut c_void, 1, pages[0..].as_ptr()) as usize, dst + PAGE);
+        unsafe { ((dst + PAGE) as *mut u8).write_bytes(0x88, PAGE); }
+        let mid = [(PAGE + 7, PAGE + 11)];
+        let _guard = victory_gpu::begin_kernel_write(dst + mid[0].0, 4, false);
+        assert!(unsafe { write_physical_alias_runs(dst as *mut u8, &src, &mid) });
+        assert_eq!(&page_bytes(pages[0])[7..11], &[0xD7;4]);
+        assert_eq!(XMemMapPhysicalPages(dst as *mut c_void, 3, std::ptr::null()) as usize, dst);
+        assert!(!unsafe { write_physical_alias_runs(dst as *mut u8, &src, &mid) });
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     #[test]
