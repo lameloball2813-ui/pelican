@@ -398,3 +398,60 @@ fn original_scene_narrow_lds_read_compute_validates() {
         eprintln!("original narrow-LDS compute PSO remains wave64-guarded: {reason}");
     }
 }
+
+/// This original 8x8 wave64 filter reads shared halfword tiles, then samples
+/// neighboring texels through separately bound SRVs before image stores.
+/// Distinct descriptor slots do not prove non-aliasing of their backing views.
+/// Keep this source-level alias/order counterexample beside the new LDS tests
+/// until full SSA and resource lifetime proofs justify host wave32 execution.
+#[test]
+fn original_scene_halfword_tile_wave64_alias_guard() {
+    let Some(dir) = std::env::var_os("VICTORY_MESH_DESCRIPTOR_DIR") else { return };
+    let bytes = std::fs::read(std::path::PathBuf::from(dir)
+        .join("compute-e535cfd7baac93b8.cso")).expect("original 8x8 filter");
+    let c = Container::parse(&bytes).unwrap();
+    let native = crate::native_programs(c.part(FourCC::DXIL).unwrap().data)
+        .unwrap().into_iter().find(|n| n.stage == HwStage::Cs).unwrap();
+    assert!(native.wave64);
+    assert!(matches!(native.io, crate::native::StageIo::Cs(cs)
+        if cs.threads == [8, 8, 1] && cs.lds_bytes() == 512));
+    let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+    let at = |offset| p.blocks.iter().flat_map(|bb| &bb.insts)
+        .find(|i| i.machine.offset == offset).expect("original source site");
+    for offset in [0x1c0, 0x1c8, 0x1d0, 0x1d8, 0x1e0, 0x298, 0x2a0, 0x2a8, 0x2b0] {
+        assert_eq!(at(offset).name(), "ds_read_u16");
+    }
+    let producers = p.blocks.iter().flat_map(|bb| &bb.insts)
+        .filter(|i| i.name() == "ds_write_b16").collect::<Vec<_>>();
+    assert_eq!(producers.len(), 1, "only the original halfword LDS tile producer");
+    assert_eq!(producers[0].machine.offset, 0x12c);
+    let mut sampled = std::collections::BTreeSet::new();
+    let mut writable = std::collections::BTreeSet::new();
+    let mut last_sample = 0;
+    let mut first_store = usize::MAX;
+    for inst in p.blocks.iter().flat_map(|bb| &bb.insts) {
+        let name = inst.name();
+        if !matches!(inst.fields, crate::gfx10::Fields::Image { .. }) { continue; }
+        if name.starts_with("image_sample") || name.starts_with("image_gather")
+            || name.starts_with("image_load") {
+            sampled.insert(inst.machine.offset);
+            last_sample = last_sample.max(inst.machine.offset);
+        }
+        if name == "image_store" {
+            writable.insert(inst.machine.offset);
+            first_store = first_store.min(inst.machine.offset);
+        }
+    }
+    assert!(sampled.contains(&0x198) && sampled.contains(&0x1a4)
+        && sampled.contains(&0x278) && sampled.contains(&0x28c),
+        "original neighboring texture sampling must remain in the audit");
+    assert_eq!(writable, [0x50c, 0x514].into_iter().collect());
+    assert!(last_sample < first_store,
+        "post-LDS texture samples precede the image stores in source order");
+    // A host wave may still store before another wave's sample, if their
+    // views alias. No single shared-memory rendezvous can prove this safe.
+    let shader = super::translate(&bytes).expect("native LDS operations translate");
+    let host = super::host::Host::new(false).expect("NVIDIA SM6.6 device");
+    assert!(host.compute_pipeline(&shader).is_err(),
+        "wave32 must remain guarded until a full alias certificate exists");
+}
