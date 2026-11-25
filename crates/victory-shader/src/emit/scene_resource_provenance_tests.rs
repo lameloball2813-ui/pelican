@@ -218,3 +218,61 @@ fn original_scene_mesh_sampler_provenance_remains_guarded() {
         }
     }
 }
+
+/// Audit original prison-world pixels that restore a saved EXEC mask after
+/// divergent branches. Missing incoming mask values at a phi cannot be
+/// replaced with a constant without an edge and dominance proof.
+#[test]
+fn original_scene_pixel_saved_exec_phi_audit() {
+    let Some(dir) = std::env::var_os("VICTORY_MESH_DESCRIPTOR_DIR") else { return };
+    for (hash, failure, restore, saved) in [
+        ("b37565055f2f7d3b", 0x5340usize, 0x5340usize, 0x2668usize),
+        ("cc6def9058a4bc0a", 0x5638, 0x5638, 0x2968),
+    ] {
+        let bytes = std::fs::read(std::path::PathBuf::from(&dir)
+            .join(format!("pixel-{hash}.cso"))).expect("original scene pixel fixture");
+        let c = Container::parse(&bytes).unwrap();
+        let native = crate::native_programs(c.part(FourCC::DXIL).unwrap().data)
+            .unwrap().into_iter().find(|n| n.stage == HwStage::Ps).unwrap();
+        let (p, structured) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)
+            .expect("native pixel SSA");
+        let st = structured.expect("native per-lane control structure");
+        assert!(!native.wave64, "these saved EXEC_LO masks are wave32");
+        let find = |offset| p.blocks.iter().flat_map(|bb| &bb.insts)
+            .find(|i| i.machine.offset == offset).expect("original machine site");
+        assert!(find(saved).name().starts_with("s_mov_b32"));
+        assert!(find(restore).name().starts_with("s_mov_b32"));
+        let block = p.blocks.iter().position(|bb| bb.offset == failure)
+            .expect("failed mask join block");
+        let bb = &p.blocks[block];
+        assert_eq!(bb.preds.len(), 3, "{hash}: three incoming mask paths");
+        let mut missing = Vec::new();
+        for phi in &bb.phis {
+            if st.masks.contains_key(&phi.value) {
+                for (i, &arg) in phi.args.iter().enumerate() {
+                    if !st.masks.contains_key(&arg) {
+                        missing.push((phi.reg, phi.value, bb.preds[i], arg));
+                    }
+                }
+            }
+        }
+        assert_eq!(missing.len(), 1, "{hash}: one untracked incoming mask");
+        for &(reg, _, pred, value) in &missing {
+            let defining = p.blocks.iter().enumerate()
+                .flat_map(|(block, bb)| bb.insts.iter().map(move |i| (block, i)))
+                .find(|(_, i)| i.writes.iter().any(|&(_, v)| v == value));
+            let (actual_block, inst) = defining.expect("untracked mask instruction");
+            assert_eq!(actual_block, pred);
+            assert_eq!(inst.name(), "v_readlane_b32");
+            assert!(inst.read(crate::ir::Reg::V(128)).is_some(),
+                "missing mask comes from lane-register data, not a saved EXEC constant");
+            let (wanted_reg, wanted_pred, wanted_offset) = if hash == "b37565055f2f7d3b" {
+                (crate::ir::Reg::S(52), 168, 0x5330)
+            } else { (crate::ir::Reg::S(56), 188, 0x5628) };
+            assert_eq!((reg, pred, inst.machine.offset), (wanted_reg, wanted_pred, wanted_offset));
+        }
+        assert!(matches!(super::translate(&bytes), Err(ShaderError::Unsupported {
+            offset, what: "a lane-mask join of an untracked mask"
+        }) if offset == failure), "must not invent a lane mask at {hash} {failure:#x}");
+    }
+}
