@@ -455,3 +455,31 @@ fn original_scene_halfword_tile_wave64_alias_guard() {
     assert!(host.compute_pipeline(&shader).is_err(),
         "wave32 must remain guarded until a full alias certificate exists");
 }
+
+/// The prison's R16 depth-array pass gathers 2D-array texels then writes
+/// multiple array UAV locations. Validate its actual native shader before
+/// pairing it with the exact whole-array D16 twin in the GPU runtime tests.
+/// Original shader bytes remain in the external fixture directory.
+#[test]
+fn original_scene_depth_array_gather_store_compute_pipeline() {
+    let Some(dir) = std::env::var_os("VICTORY_MESH_DESCRIPTOR_DIR") else { return };
+    let bytes = std::fs::read(std::path::PathBuf::from(dir)
+        .join("compute-ec982aaadc623a49.cso")).expect("original prison depth-array compute");
+    let c = Container::parse(&bytes).unwrap();
+    let native = crate::native_programs(c.part(FourCC::DXIL).unwrap().data)
+        .unwrap().into_iter().find(|n| n.stage == HwStage::Cs).unwrap();
+    let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+    let at = |offset| p.blocks.iter().flat_map(|bb| &bb.insts)
+        .find(|i| i.machine.offset == offset).expect("original array access site");
+    assert_eq!(at(0x98).name(), "image_gather4_lz");
+    for offset in [0xe8, 0x10c, 0x118, 0x124] {
+        assert_eq!(at(offset).name(), "image_store");
+    }
+    let shader = super::translate(&bytes).expect("original 2D-array compute translation");
+    let mut dxil = shader.dxil.clone();
+    let mut validator = super::validator::Validator::load(
+        super::validator::Validator::default_path().as_deref()).expect("DXIL validator");
+    validator.validate(&mut dxil).expect("original array compute DXIL validation");
+    let host = super::host::Host::new(false).expect("NVIDIA SM6.6 device");
+    host.compute_pipeline(&shader).expect("original depth-array compute NVIDIA pipeline");
+}

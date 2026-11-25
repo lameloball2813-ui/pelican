@@ -19,8 +19,9 @@ const DST: u32 = 0x400;
 pub(crate) struct Twin {
     color: Arc<HostTexture>,
     scratch: ID3D12Resource,
-    depth_fp: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-    color_fp: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    // Every slice has separately certified identical 16-bit copy footprints.
+    // Scratch is reused serially, never across pending unordered operations.
+    copies: Vec<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)>,
 }
 
 // The resources are free-threaded; their commands are ordered on the host queue.
@@ -88,17 +89,43 @@ fn eligible(d: &D3D12_RESOURCE_DESC) -> bool {
         && d.Format == DXGI_FORMAT_R16_TYPELESS
         && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0
         && d.Width > 0 && d.Height > 0
-        && d.DepthOrArraySize == 1 && d.MipLevels == 1
+        && d.DepthOrArraySize >= 1
+        && d.DepthOrArraySize <= crate::resource::D16_TWIN_MAX_SLICES
+        && d.MipLevels == 1
         && d.SampleDesc.Count == 1 && d.SampleDesc.Quality == 0
 }
 
 /// Exact single-plane view, no reinterpretation of the requested data type.
-fn view_format(d: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> Option<DXGI_FORMAT> {
-    if d.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D
-        || !matches!(d.Format, DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_UNORM)
-    { return None; }
-    let sub = unsafe { d.Anonymous.Texture2D };
-    (sub.MipSlice == 0 && sub.PlaneSlice == 0).then_some(d.Format)
+fn view_format(d: &D3D12_UNORDERED_ACCESS_VIEW_DESC, slices: u16) -> Option<DXGI_FORMAT> {
+    if !matches!(d.Format, DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R16_UNORM)
+        || slices == 0 { return None; }
+    match d.ViewDimension {
+        D3D12_UAV_DIMENSION_TEXTURE2D if slices == 1 => {
+            let sub = unsafe { d.Anonymous.Texture2D };
+            (sub.MipSlice == 0 && sub.PlaneSlice == 0).then_some(d.Format)
+        }
+        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+            let sub = unsafe { d.Anonymous.Texture2DArray };
+            (sub.MipSlice == 0 && sub.PlaneSlice == 0
+                && sub.ArraySize != 0 && sub.FirstArraySlice < u32::from(slices)
+                && sub.ArraySize <= u32::from(slices) - sub.FirstArraySlice).then_some(d.Format)
+        }
+        _ => None,
+    }
+}
+
+/// Reuse the existing descriptor::host::fits normalization for 16-bit packed
+/// UAV views backed by R16_TYPELESS. The previous scratch stand-in always
+/// exposed these as UINT16; the coherent twin must keep that exact value
+/// interpretation instead of rejecting the legacy console format.
+fn normalize_view(d: &D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    resource: &D3D12_RESOURCE_DESC) -> D3D12_UNORDERED_ACCESS_VIEW_DESC
+{
+    let mut view = *d;
+    if resource.Format == DXGI_FORMAT_R16_TYPELESS
+        && matches!(view.Format.0, 0 | 86 | 115)
+    { view.Format = DXGI_FORMAT_R16_UINT; }
+    view
 }
 
 fn supported(format: DXGI_FORMAT) -> bool {
@@ -122,12 +149,51 @@ fn supported(format: DXGI_FORMAT) -> bool {
     })
 }
 
-fn footprint(device: &ID3D12Device, d: &D3D12_RESOURCE_DESC)
+/// A small bounded set of distinct rejected layout signatures. A single
+/// scene may bind thousands of shadow-map UAVs, so report a representative
+/// resource for each unsupported shape rather than logging every dispatch.
+/// This preserves the fallback path and never treats pointer equality as an
+/// alias-coherence proof.
+fn report_rejection(resource: This, desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC, reason: &'static str) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static LOGGED: OnceLock<Mutex<HashSet<(u64, u32, u16, i32, i32, &'static str)>>> = OnceLock::new();
+    let dd = crate::resource::host_copy(resource)
+        .map(|depth| unsafe { depth.texture.GetDesc() });
+    let width = dd.as_ref().map_or(0, |d| d.Width);
+    let height = dd.as_ref().map_or(0, |d| d.Height);
+    let slices = dd.as_ref().map_or(0, |d| d.DepthOrArraySize);
+    let key = (width, height, slices, desc.Format.0, desc.ViewDimension.0, reason);
+    let mut logged = LOGGED.get_or_init(|| Mutex::new(HashSet::new()))
+        .lock().unwrap_or_else(|e| e.into_inner());
+    if logged.contains(&key) || logged.len() >= 128 { return; }
+    logged.insert(key);
+    drop(logged);
+    let (first_slice, view_slices, mip, plane) = if desc.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY {
+        let a = unsafe { desc.Anonymous.Texture2DArray };
+        (a.FirstArraySlice, a.ArraySize, a.MipSlice, a.PlaneSlice)
+    } else if desc.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D {
+        let a = unsafe { desc.Anonymous.Texture2D };
+        (0, 1, a.MipSlice, a.PlaneSlice)
+    } else { (0, 0, 0, 0) };
+    let original_data = crate::resource::texture_memory(resource)
+        .map(|(address, _)| address as usize);
+    tracing::warn!(reason, object=?resource, width, height, slices,
+        original_data=?original_data,
+        host_format=dd.as_ref().map(|d| d.Format.0).unwrap_or(0),
+        host_flags=dd.as_ref().map(|d| d.Flags.0).unwrap_or(0),
+        title_rejection=?crate::resource::d16_twin_rejection(resource),
+        uav_format=desc.Format.0, uav_dimension=desc.ViewDimension.0,
+        first_slice, view_slices, mip, plane,
+        "D16 coherent twin unavailable; depth UAV still uses scratch fallback");
+}
+
+fn footprint(device: &ID3D12Device, d: &D3D12_RESOURCE_DESC, index: u32)
     -> (D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32, u64, u64)
 {
     let (mut fp, mut rows, mut row_bytes, mut total) =
         (D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(), 0, 0, 0);
-    unsafe { device.GetCopyableFootprints(d, 0, 1, 0, Some(&mut fp),
+    unsafe { device.GetCopyableFootprints(d, index, 1, 0, Some(&mut fp),
         Some(&mut rows), Some(&mut row_bytes), Some(&mut total)) };
     (fp, rows, row_bytes, total)
 }
@@ -148,8 +214,8 @@ impl Twin {
             CreationNodeMask: 1, VisibleNodeMask: 1,
             ..Default::default()
         };
-        let (df, dr, db, ds) = footprint(&host.device, &dd);
-        let (cf, cr, cb, cs) = footprint(&host.device, &cd);
+        let mut copies = Vec::with_capacity(dd.DepthOrArraySize as usize);
+        let mut scratch_bytes = 0;
         // Both footprints must describe exactly the same 16-bit texels.
         // Reject instead of copying padding, a second plane or a conversion.
         let exact = |f: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, rows, bytes, total| {
@@ -160,9 +226,14 @@ impl Twin {
                 && total != 0 && total != u64::MAX
                 && crate::resource::family(f.Footprint.Format.0 as u32) == 53
         };
-        if !exact(&df, dr, db, ds) || !exact(&cf, cr, cb, cs)
-            || df.Footprint.RowPitch != cf.Footprint.RowPitch
-        { return None; }
+        for index in 0..u32::from(dd.DepthOrArraySize) {
+            let (df, dr, db, ds) = footprint(&host.device, &dd, index);
+            let (cf, cr, cb, cs) = footprint(&host.device, &cd, index);
+            if !exact(&df, dr, db, ds) || !exact(&cf, cr, cb, cs)
+                || df.Footprint.RowPitch != cf.Footprint.RowPitch { return None; }
+            scratch_bytes = scratch_bytes.max(ds).max(cs);
+            copies.push((df, cf));
+        }
         let make = |d: &D3D12_RESOURCE_DESC| -> Option<ID3D12Resource> {
             let mut out = None;
             unsafe { host.device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE,
@@ -172,32 +243,33 @@ impl Twin {
         let color = make(&cd)?;
         let scratch = make(&D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: ds.max(cs), Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+            Width: scratch_bytes, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
             SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             ..Default::default()
         })?;
         crate::host::name(&color, || format!("D16 writable twin {}x{}", dd.Width, dd.Height));
-        tracing::info!(width=dd.Width, height=dd.Height, "D16 coherent writable twin created");
-        Some(Self { color: HostTexture::internal(color), scratch, depth_fp: df, color_fp: cf })
+        tracing::info!(width=dd.Width, height=dd.Height, slices=dd.DepthOrArraySize,
+            "D16 coherent writable twin created");
+        Some(Self { color: HostTexture::internal(color), scratch, copies })
     }
 
     /// Record a whole-subresource copy through exact buffer footprints. The
     /// private scratch returns to COMMON after each copy, on the same queue.
     fn copy(&self, list: &HostList, depth: &Arc<HostTexture>, to: Side) {
-        let (src, dst, sf, df) = if to == Side::Depth {
-            (&self.color, depth, self.color_fp, self.depth_fp)
+        let (src, dst) = if to == Side::Depth {
+            (&self.color, depth)
         } else {
-            (depth, &self.color, self.depth_fp, self.color_fp)
+            (depth, &self.color)
         };
         let mut barriers = Vec::new();
         barriers.extend(list.move_texture(src, SRC));
         barriers.extend(list.move_texture(dst, DST));
         barriers.push(transition(&self.scratch, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST));
-        let sub = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+        let sub = |r: &ID3D12Resource, index| D3D12_TEXTURE_COPY_LOCATION {
             pResource: unsafe { std::mem::transmute_copy(r) },
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
         };
         let place = |f| D3D12_TEXTURE_COPY_LOCATION {
             pResource: unsafe { std::mem::transmute_copy(&self.scratch) },
@@ -206,12 +278,22 @@ impl Twin {
         };
         unsafe {
             list.list.ResourceBarrier(&barriers);
-            list.list.CopyTextureRegion(&place(sf), 0, 0, 0, &sub(&src.texture), None);
-            list.list.ResourceBarrier(&[transition(&self.scratch,
-                D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-            list.list.CopyTextureRegion(&sub(&dst.texture), 0, 0, 0, &place(df), None);
-            list.list.ResourceBarrier(&[transition(&self.scratch,
-                D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+            for (index, &(depth_fp, color_fp)) in self.copies.iter().enumerate() {
+                let (sf, df) = if to == Side::Depth { (color_fp, depth_fp) }
+                    else { (depth_fp, color_fp) };
+                list.list.CopyTextureRegion(&place(sf), 0, 0, 0,
+                    &sub(&src.texture, index as u32), None);
+                list.list.ResourceBarrier(&[transition(&self.scratch,
+                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.list.CopyTextureRegion(&sub(&dst.texture, index as u32),
+                    0, 0, 0, &place(df), None);
+                // Each slice is complete on the single host queue before
+                // scratch is reused, including the last slice's transition.
+                list.list.ResourceBarrier(&[transition(&self.scratch,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    if index + 1 == self.copies.len() { D3D12_RESOURCE_STATE_COMMON }
+                    else { D3D12_RESOURCE_STATE_COPY_DEST })]);
+            }
         }
     }
 }
@@ -219,17 +301,38 @@ impl Twin {
 pub(crate) fn uav(resource: This, desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource>
 {
-    if !crate::resource::d16_twin_candidate(resource) { return None; }
-    if !view_format(desc).is_some_and(supported) {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(format = desc.Format.0, dimension = desc.ViewDimension.0,
-            "D16 UAV descriptor outside exact twin support"));
+    if let Some(reason) = crate::resource::d16_twin_rejection(resource) {
+        report_rejection(resource, desc, reason);
         return None;
     }
-    let depth = crate::resource::host_copy(resource)?;
-    let twin = depth.twin.get_or_init(|| Twin::make(&depth)).as_ref()?;
+    let Some(depth) = crate::resource::host_copy(resource) else {
+        report_rejection(resource, desc, "host_texture_unavailable");
+        return None;
+    };
+    let dd = unsafe { depth.texture.GetDesc() };
+    let resolved = normalize_view(desc, &dd);
+    let Some(format) = view_format(&resolved, dd.DepthOrArraySize) else {
+        report_rejection(resource, desc, "unsupported_view_format_or_slice_range");
+        return None;
+    };
+    if !supported(format) {
+        report_rejection(resource, desc, "host_typed_uav_unavailable");
+        return None;
+    }
+    let first_use = depth.twin.get().is_none();
+    let Some(twin) = depth.twin.get_or_init(|| Twin::make(&depth)).as_ref() else {
+        report_rejection(resource, desc, "exact_twin_creation_or_footprint_failed");
+        return None;
+    };
+    if first_use && dd.DepthOrArraySize > 1 {
+        tracing::info!(object=?resource,
+            original_data=?crate::resource::texture_memory(resource).map(|(address, _)| address as usize),
+            width=dd.Width, height=dd.Height, slices=dd.DepthOrArraySize,
+            requested_format=desc.Format.0, resolved_format=resolved.Format.0,
+            "original D16 array UAV using coherent twin, not scratch");
+    }
     unsafe { host()?.device.CreateUnorderedAccessView(&twin.color.texture,
-        None::<&ID3D12Resource>, Some(desc), at) };
+        None::<&ID3D12Resource>, Some(&resolved), at) };
     Some(twin.color.texture.clone())
 }
 
@@ -266,9 +369,11 @@ pub(crate) fn depth_use(list: &HostList, resource: This, wanted: u32) -> bool {
 }
 
 pub(crate) fn uav_use(list: &HostList, resource: This, desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC) -> bool {
-    if !crate::resource::d16_twin_candidate(resource)
-        || !view_format(desc).is_some_and(supported) { return false; }
+    if !crate::resource::d16_twin_candidate(resource) { return false; }
     let Some(depth) = crate::resource::host_copy(resource) else { return false };
+    let dd = unsafe { depth.texture.GetDesc() };
+    let resolved = normalize_view(desc, &dd);
+    if !view_format(&resolved, dd.DepthOrArraySize).is_some_and(supported) { return false; }
     if !depth.twin.get().is_some_and(Option::is_some) { return false; }
     route(list, depth, Side::Twin, UAV)
 }
@@ -331,7 +436,9 @@ mod tests {
         assert!(!eligible(&d));
         d.MipLevels = 1;
         d.DepthOrArraySize = 2;
-        assert!(!eligible(&d));
+        assert!(eligible(&d), "all array slices must be copied coherently");
+        d.DepthOrArraySize = crate::resource::D16_TWIN_MAX_SLICES + 1;
+        assert!(!eligible(&d), "large arrays are not certified for whole-resource copies");
         d.DepthOrArraySize = 1;
         d.SampleDesc.Count = 4;
         assert!(!eligible(&d));
@@ -342,17 +449,44 @@ mod tests {
             Format: DXGI_FORMAT_R16_UINT, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
             ..Default::default()
         };
-        assert_eq!(view_format(&u), Some(DXGI_FORMAT_R16_UINT));
+        assert_eq!(view_format(&u, 1), Some(DXGI_FORMAT_R16_UINT));
+        assert!(view_format(&u, 2).is_none(), "array requires 2DARRAY descriptor");
         u.Format = DXGI_FORMAT_R16_UNORM;
-        assert_eq!(view_format(&u), Some(DXGI_FORMAT_R16_UNORM));
+        assert_eq!(view_format(&u, 1), Some(DXGI_FORMAT_R16_UNORM));
         u.Format = DXGI_FORMAT_R16_FLOAT;
-        assert!(view_format(&u).is_none());
+        assert!(view_format(&u, 1).is_none());
         u.Format = DXGI_FORMAT_R16_UINT;
         u.Anonymous.Texture2D.MipSlice = 1;
-        assert!(view_format(&u).is_none());
+        assert!(view_format(&u, 1).is_none());
         u.Anonymous.Texture2D.MipSlice = 0;
         u.Anonymous.Texture2D.PlaneSlice = 1;
-        assert!(view_format(&u).is_none());
+        assert!(view_format(&u, 1).is_none());
+        let mut a = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R16_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                    MipSlice: 0, FirstArraySlice: 2, ArraySize: 4, PlaneSlice: 0,
+                },
+            },
+        };
+        assert_eq!(view_format(&a, 6), Some(DXGI_FORMAT_R16_UINT));
+        assert!(view_format(&a, 5).is_none(), "array view may not exceed allocation");
+        a.Anonymous.Texture2DArray.ArraySize = 0;
+        assert!(view_format(&a, 6).is_none(), "empty UAV array view is invalid");
+        a.Anonymous.Texture2DArray.ArraySize = 1;
+        a.Anonymous.Texture2DArray.PlaneSlice = 1;
+        assert!(view_format(&a, 6).is_none(), "second plane is not coherent R16");
+        d.Format = DXGI_FORMAT_R16_TYPELESS;
+        a.Anonymous.Texture2DArray.PlaneSlice = 0;
+        for format in [0, 86, 115] {
+            a.Format = DXGI_FORMAT(format);
+            assert_eq!(normalize_view(&a, &d).Format, DXGI_FORMAT_R16_UINT,
+                "legacy packed-view normalization must match the scratch path");
+        }
+        d.Format = DXGI_FORMAT_R32_TYPELESS;
+        assert_eq!(normalize_view(&a, &d).Format, a.Format,
+            "normalization must not reinterpret another resource family");
     }
 
     /// Hardware: actual typed UINT16 UAV read-modify-write and UNORM depth
@@ -493,6 +627,207 @@ void main(uint3 id : SV_DispatchThreadID) {
         conflict.close();
         host.execute(&[&conflict, &reader]);
         check(0, 1);
+        crate::object::slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
+        unsafe { std::alloc::dealloc(memory, layout) };
+    }
+
+    /// Original prison compute shaders bind writable R16 depth arrays. Each
+    /// UAV use must preserve all other array slices, including when lists are
+    /// recorded out of submission order and a prior writer is replayed.
+    #[test]
+    fn d16_array_twin_preserves_slices_and_submission_order() {
+        let Some(host) = host() else { return };
+        assert!(supported(DXGI_FORMAT_R16_UINT), "R16 UINT typed UAV support required");
+        const SLICES: usize = 6;
+        const PIXELS: usize = 64;
+        let layout = std::alloc::Layout::from_size_align(65536, 65536).unwrap();
+        let memory = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!memory.is_null());
+        let words = [3u32, 0, 0, 0, 8, 0, 8, SLICES as u32 | (1 << 16), 53, 1, 0, 0, 6, 0];
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut resource = std::ptr::null();
+        assert_eq!(crate::resource::create_at_address(std::ptr::null(), memory as u64,
+            words.as_ptr().cast(), 0, std::ptr::null(), &iid, &mut resource), 0);
+        assert!(crate::resource::d16_twin_candidate(resource));
+        let depth = crate::resource::host_copy(resource).unwrap();
+        assert_eq!(unsafe { depth.texture.GetDesc() }.DepthOrArraySize, SLICES as u16);
+        let heap: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: 4,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0,
+            }).unwrap()
+        };
+        let (cpu, gpu, step) = unsafe { (heap.GetCPUDescriptorHandleForHeapStart(),
+            heap.GetGPUDescriptorHandleForHeapStart(),
+            host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)) };
+        let array = |first, size| D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R16_UINT, ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_UAV {
+                    MipSlice: 0, FirstArraySlice: first, ArraySize: size, PlaneSlice: 0,
+                },
+            },
+        };
+        let entire = array(0, SLICES as u32);
+        let partial = array(2, 1);
+        let mut legacy = entire;
+        legacy.Format = DXGI_FORMAT_UNKNOWN;
+        assert!(uav(resource, &entire, cpu).is_some(), "six coherent slices with exact footprints");
+        let partial_cpu = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu.ptr + 2 * step as usize };
+        assert!(uav(resource, &partial, partial_cpu).is_some(), "one-slice UAV on full coherent array");
+        let legacy_cpu = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu.ptr + 3 * step as usize };
+        assert!(uav(resource, &legacy, legacy_cpu).is_some(),
+            "legacy untyped console view must normalize to the existing R16 UINT representation");
+        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R16_UNORM, ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                    MostDetailedMip: 0, MipLevels: 1, FirstArraySlice: 0,
+                    ArraySize: SLICES as u32, PlaneSlice: 0, ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        let srv_cpu = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu.ptr + step as usize };
+        let srv_gpu = D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu.ptr + u64::from(step) };
+        let partial_gpu = D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu.ptr + 2 * u64::from(step) };
+        let legacy_gpu = D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu.ptr + 3 * u64::from(step) };
+        unsafe { host.device.CreateShaderResourceView(&depth.texture, Some(&srv), srv_cpu) };
+        let dsv = host.dsv(&depth.texture, Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+            Format: DXGI_FORMAT_D16_UNORM,
+            ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
+            Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_DSV {
+                    MipSlice: 0, FirstArraySlice: 0, ArraySize: SLICES as u32,
+                },
+            },
+            ..Default::default()
+        }));
+        let (full_root, full_pso) = compile(r#"
+RWTexture2DArray<uint> t : register(u0);
+[RootSignature("DescriptorTable(UAV(u0))")]
+[numthreads(8,8,1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    t[id] += 101 + id.x + 8 * id.y + 201 * id.z;
+}
+"#);
+        let (partial_root, partial_pso) = compile(r#"
+RWTexture2DArray<uint> t : register(u0);
+[RootSignature("DescriptorTable(UAV(u0))")]
+[numthreads(8,8,1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    t[id] += 17;
+}
+"#);
+        let (read_root, read_pso) = compile(r#"
+Texture2DArray<float> t : register(t0);
+RWByteAddressBuffer outbuf : register(u1);
+[RootSignature("DescriptorTable(SRV(t0)), UAV(u1)")]
+[numthreads(8,8,1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    outbuf.Store((id.z * 64 + id.y * 8 + id.x) * 4,
+        asuint(t.Load(int4(id, 0))));
+}
+"#);
+        let (out, mapped) = host.shared_buffer((SLICES * PIXELS * 4) as u64).unwrap();
+        let bind_write = |list: &HostList, subset: bool| {
+            let op = begin(list);
+            assert!(uav_use(list, resource, if subset { &partial } else { &entire }));
+            assert!(op.valid());
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                list.list.SetComputeRootSignature(if subset { &partial_root } else { &full_root });
+                list.list.SetPipelineState(if subset { &partial_pso } else { &full_pso });
+                list.list.SetComputeRootDescriptorTable(0, if subset { partial_gpu } else { gpu });
+                list.list.Dispatch(1, 1, if subset { 1 } else { SLICES as u32 });
+            }
+        };
+        let bind_read = |list: &HostList| {
+            let op = begin(list);
+            crate::list::ensure_state(list, resource, 0x40 | 0x80);
+            assert!(op.valid());
+            list.ensure_buffer_state(&out, UAV);
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                list.list.SetComputeRootSignature(&read_root);
+                list.list.SetPipelineState(&read_pso);
+                list.list.SetComputeRootDescriptorTable(0, srv_gpu);
+                list.list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                list.list.Dispatch(1, 1, SLICES as u32);
+            }
+        };
+        let check = |writes: u32, partial_writes: u32| {
+            for slice in 0..SLICES {
+                for pixel in 0..PIXELS {
+                    let index = slice * PIXELS + pixel;
+                    let actual = unsafe { mapped.add(index * 4).cast::<f32>().read_unaligned() };
+                    let expected = (writes * (101 + pixel as u32 + 201 * slice as u32)
+                        + if slice == 2 { partial_writes * 17 } else { 0 }) as f32 / 65535.0;
+                    assert!((actual - expected).abs() < 1e-7,
+                        "slice={slice} pixel={pixel} full={writes} partial={partial_writes}: {actual} != {expected}");
+                }
+            }
+        };
+        let writer = host.new_list().unwrap();
+        bind_write(&writer, false);
+        writer.close();
+        let clear = host.new_list().unwrap();
+        crate::list::ensure_state(&clear, resource, 0x10);
+        unsafe { clear.list.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 0.0, 0, None) };
+        clear.close();
+        let reader = host.new_list().unwrap();
+        bind_read(&reader);
+        reader.close();
+        // Submission order matters more than recording order.
+        host.execute(&[&clear, &writer, &reader]);
+        check(1, 0);
+        host.execute(&[&writer, &reader]);
+        check(2, 0);
+        let subset = host.new_list().unwrap();
+        bind_write(&subset, true);
+        subset.close();
+        host.execute(&[&subset, &reader]);
+        check(2, 1);
+        // A new clear supersedes all earlier writes; replay a previously
+        // recorded partial writer without reviving stale data in other slices.
+        host.execute(&[&clear, &subset, &reader]);
+        check(0, 1);
+        // Within one list the writable twin is copied back only at close.
+        let alternating = host.new_list().unwrap();
+        bind_write(&alternating, false);
+        bind_read(&alternating);
+        alternating.close();
+        host.execute(&[&alternating, &reader]);
+        check(1, 1);
+        let conflict = host.new_list().unwrap();
+        {
+            let op = begin(&conflict);
+            assert!(uav_use(&conflict, resource, &partial));
+            assert!(depth_use(&conflict, resource, 0x40));
+            assert!(!op.valid(), "same-dispatch depth+UAV alias must remain rejected");
+        }
+        conflict.close();
+        host.execute(&[&conflict, &reader]);
+        check(1, 1);
+        // The legacy descriptor's UNKNOWN/packed 16-bit format must route
+        // through the same coherent UINT view, never a separate scratch.
+        let legacy_writer = host.new_list().unwrap();
+        {
+            let op = begin(&legacy_writer);
+            assert!(uav_use(&legacy_writer, resource, &legacy));
+            assert!(op.valid());
+            unsafe {
+                legacy_writer.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                legacy_writer.list.SetComputeRootSignature(&full_root);
+                legacy_writer.list.SetPipelineState(&full_pso);
+                legacy_writer.list.SetComputeRootDescriptorTable(0, legacy_gpu);
+                legacy_writer.list.Dispatch(1, 1, SLICES as u32);
+            }
+        }
+        legacy_writer.close();
+        host.execute(&[&legacy_writer, &reader]);
+        check(2, 1);
         crate::object::slot::<extern "system" fn(This) -> u32>(resource, 0x10)(resource);
         unsafe { std::alloc::dealloc(memory, layout) };
     }

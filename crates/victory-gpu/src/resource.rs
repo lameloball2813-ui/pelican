@@ -969,17 +969,34 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
 }
 
 /// Restrict the depth twin to original object-backed, single-plane D16
-/// resources. Synthetic alias views have no proven writer identity.
+/// resources with exact single-mip array subresources. Synthetic alias
+/// views have no proven writer identity; whole-array copies retain every
+/// slice at each list's canonical-depth boundary.
+pub(crate) const D16_TWIN_MAX_SLICES: u16 = 16;
+
 #[cfg(windows)]
 pub(crate) fn d16_twin_candidate(this: This) -> bool {
-    if this.is_null() { return false; }
+    d16_twin_rejection(this).is_none()
+}
+
+/// Exact reasons are reported only when a depth UAV would otherwise be
+/// replaced with a scratch stand-in. This does not change the safety gate.
+#[cfg(windows)]
+pub(crate) fn d16_twin_rejection(this: This) -> Option<&'static str> {
+    if this.is_null() { return Some("null_resource"); }
     let r = resource(this);
     let d = &r.desc;
-    !matches!(&r.backing, Backing::Synthetic(_))
-        && d.dimension == 3 && matches!(d.format, 53 | 55)
-        && d.flags & 2 != 0 && d.width != 0 && d.height != 0
-        && d.depth_or_array_size == 1 && d.mip_levels == 1
-        && d.sample_count == 1 && d.sample_quality == 0
+    if matches!(&r.backing, Backing::Synthetic(_)) { return Some("synthetic_alias_no_writer_identity"); }
+    if d.dimension != 3 { return Some("not_texture2d"); }
+    if !matches!(d.format, 53 | 55) { return Some("not_r16_depth_family"); }
+    if d.flags & 2 == 0 { return Some("no_depth_flag"); }
+    if d.width == 0 || d.height == 0 || d.depth_or_array_size == 0 { return Some("empty_texture_or_array"); }
+    // Original prison arrays use six slices. Larger arrays require separate
+    // resource lifetime and VRAM budgeting proof before whole-array copies.
+    if d.depth_or_array_size > D16_TWIN_MAX_SLICES { return Some("array_exceeds_certified_slice_limit"); }
+    if d.mip_levels != 1 { return Some("multiple_mips"); }
+    if d.sample_count != 1 || d.sample_quality != 0 { return Some("multisample_or_quality"); }
+    None
 }
 
 /// A host texture like the title's: same description, in GPU memory,
