@@ -341,4 +341,15 @@ fn original_scene_half_bias_2d_pixel_validates() {
     host.root_signature_for(&[(&shader,
         windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_PIXEL)])
         .expect("original a16 sampleBias root layout");
+    // Use the actual scene's paired mesh stage, not an invented vertex
+    // shader. This checks the driver accepts the complete graphics pipeline
+    // in addition to standalone pixel DXIL and root-layout validation.
+    if let Some(mesh_dir) = std::env::var_os("VICTORY_MESH_DESCRIPTOR_DIR") {
+        let mesh_bytes = std::fs::read(std::path::PathBuf::from(mesh_dir)
+            .join("mesh-4c1c0bc01e07c903.cso")).expect("paired original mesh fixture");
+        let mesh = super::translate(&mesh_bytes)
+            .expect("original mesh paired with half-bias pixel must translate");
+        host.mesh_pipeline(&mesh, &shader)
+            .expect("original prison mesh+pixel graphics pipeline on NVIDIA");
+    }
 }
