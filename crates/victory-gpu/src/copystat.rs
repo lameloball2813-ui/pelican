@@ -75,13 +75,20 @@ pub(crate) enum C {
 const COUNTERS: usize = C::CardUnchangedBytes as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 const REFUSAL_BINS: usize = crate::host::PhysicalWriteRefusal::COUNT + 2;
-static PHYSICAL_REFUSALS: [AtomicU64; REFUSAL_BINS] = [const { AtomicU64::new(0) }; REFUSAL_BINS];
+// Each reason counts page groups, exact refused runs/bytes and time spent
+// attempting that group. A single poorly-mapped page with many sparse runs
+// can dominate kernel writeback although its reason occurs only once.
+const REFUSAL_FIELDS: usize = 4;
+static PHYSICAL_REFUSALS: [[AtomicU64; REFUSAL_FIELDS]; REFUSAL_BINS] =
+    [const { [const { AtomicU64::new(0) }; REFUSAL_FIELDS] }; REFUSAL_BINS];
 
 /// The caller aggregates one complete sparse title span before publishing
 /// reasons; never add an atomic operation for each byte or each page run.
-pub(crate) fn physical_refusals(bins: &[u64; REFUSAL_BINS]) {
-    for (counter, &value) in PHYSICAL_REFUSALS.iter().zip(bins) {
-        if value != 0 { counter.fetch_add(value, Relaxed); }
+pub(crate) fn physical_refusals(bins: &[[u64; REFUSAL_FIELDS]; REFUSAL_BINS]) {
+    for (counters, values) in PHYSICAL_REFUSALS.iter().zip(bins) {
+        for (counter, &value) in counters.iter().zip(values) {
+            if value != 0 { counter.fetch_add(value, Relaxed); }
+        }
     }
 }
 
@@ -236,13 +243,16 @@ pub(crate) fn log(frames: f64) {
     tracing::info!("stable physical alias reads per frame: {:.1} MB, {:.1} ms", mb(c[C::PhysicalReadBytes as usize]), ms(c[C::PhysicalReadUs as usize]));
     tracing::info!("stable physical alias writes per frame: {:.1} MB, {:.1} ms, {:.0} runs; kernel fallback {:.0} runs", mb(c[C::PhysicalWriteBytes as usize]), ms(c[C::PhysicalWriteUs as usize]), c[C::PhysicalWriteRuns as usize], c[C::BackKernelWriteRuns as usize]);
     tracing::info!("physical alias write attempts per frame: {:.0} successful pages, {:.0} refused pages, {:.1} MB refused, {:.0} refused runs, {:.1} ms attempts ({:.1} ms refused); kernel fallback {:.1} MB", c[C::PhysicalWriteSucceededGroups as usize], c[C::PhysicalWriteRefusedGroups as usize], mb(c[C::PhysicalWriteRefusedBytes as usize]), c[C::PhysicalWriteRefusedRuns as usize], ms(c[C::PhysicalWriteAttemptUs as usize]), ms(c[C::PhysicalWriteRefusedUs as usize]), mb(c[C::BackKernelWriteBytes as usize]));
-    for (i, counter) in PHYSICAL_REFUSALS.iter().enumerate() {
-        let groups = counter.swap(0, Relaxed);
+    for (i, counters) in PHYSICAL_REFUSALS.iter().enumerate() {
+        let [groups, runs, bytes, micros] = std::array::from_fn(|field| counters[field].swap(0, Relaxed));
         if groups != 0 {
             let label = if i == crate::host::PhysicalWriteRefusal::COUNT { "disabled" }
                 else if i == crate::host::PhysicalWriteRefusal::COUNT + 1 { "uninstalled" }
                 else { crate::host::PhysicalWriteRefusal::NAMES[i] };
             tracing::info!(reason=label, pages_per_frame=groups as f64 / frames,
+                runs_per_frame=runs as f64 / frames,
+                megabytes_per_frame=bytes as f64 / frames / 1e6,
+                attempt_ms_per_frame=micros as f64 / frames / 1e3,
                 "physical alias write refusal");
         }
     }
