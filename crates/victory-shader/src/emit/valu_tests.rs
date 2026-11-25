@@ -335,6 +335,222 @@ fn static_table_cbv_packed_numerical() {
     assert!(ran>0);
 }
 
+/// Actual GFX10 LDS byte/halfword opcodes, executed on the hardware adapter
+/// and WARP, with poisoned neighboring halves and signed/unsigned values.
+/// Each lane writes its own dword, then reads the same address, so this test
+/// does not assume the unsupported native 64-lane cross-thread tile ordering.
+#[test]
+fn native_lds_narrow_reads_numerical() {
+    // The second dword encodes vdst:vaddr. DS offsets are byte offsets.
+    let samples: [(u32, u32, bool, u32); 12] = [
+        (0x3c, 0, false, 16), (0x3c, 2, false, 16),
+        (0x3b, 0, true, 16), (0x3b, 2, true, 16),
+        (0x3a, 0, false, 8), (0x3a, 1, false, 8),
+        (0x3a, 2, false, 8), (0x3a, 3, false, 8),
+        (0x39, 0, true, 8), (0x39, 1, true, 8),
+        (0x39, 2, true, 8), (0x39, 3, true, 8),
+    ];
+    let mut words = vec![s_mov_b32(5, 128)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.push(vop2(0x1a, 2, 130, 0)); // v2 = thread ID * 4
+    words.push(vop1(1, 3, sgpr(0)));
+    words.push(vop2(0x25, 3, vgpr(0), 3)); // distinct dword for each lane
+    words.extend([0xD8340000, 0x00000302]); // ds_write_b32 v2,v3
+    words.push(vop2(0x1a, 5, 134, 0)); // per-lane output stride 64 bytes
+    for (slot, &(opcode, offset, _, _)) in samples.iter().enumerate() {
+        words.extend([0xD8000000 | opcode << 18 | offset, 0x04000002]);
+        let mut store = buffer_store_dword_offen(4, 5, 8);
+        store[0] |= (slot * 4) as u32;
+        words.extend(store);
+    }
+    words.push(vop2(0x25, 6, 130, 2)); // v6 = v2 + 2: dynamic address
+    words.extend([0xD8F00000, 0x04000006]); // u16, offset0, v6
+    let mut store = buffer_store_dword_offen(4, 5, 8);
+    store[0] |= 12 * 4;
+    words.extend(store);
+    let mut store = buffer_store_dword_offen(3, 5, 8);
+    store[0] |= 13 * 4;
+    words.extend(store);
+    words.extend([0xD8D80000, 0x04000002]); // plain ds_read_b32
+    let mut store = buffer_store_dword_offen(4, 5, 8);
+    store[0] |= 14 * 4;
+    words.extend(store);
+    words.push(S_ENDPGM);
+    // Console LDS allocation is in 512-byte granules.
+    let shader = build_cs_config(&words, 32, false, 512, false);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = match host.compute_pipeline(&shader) {
+            Ok(p) => p,
+            Err(e) if warp => { eprintln!("WARP lacks narrow LDS pipeline support: {e}"); continue },
+            Err(e) => panic!("{label}: narrow LDS compute PSO: {e}"),
+        };
+        for source in [0x80fe7f81u32, 0x7f018000, 0xff0080ff, 0x0000ffff] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) if u.dword == 0 => source,
+                    (RootType::Constants, 0) => 0,
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected narrow LDS root {other:?}"),
+                };
+            }
+            let out = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(32 * 16)], samplers: &[], groups: [1, 1, 1],
+            }).unwrap_or_else(|e| panic!("{label}: narrow LDS dispatch: {e}"));
+            for lane in 0..32 {
+                let value = source.wrapping_add(lane);
+                for (slot, &(_, byte, signed, bits)) in samples.iter().enumerate() {
+                    let x = value >> (8 * byte);
+                    let expected = match (bits, signed) {
+                        (8, true) => (x as u8 as i8 as i32) as u32,
+                        (8, false) => x & 0xff,
+                        (16, true) => (x as u16 as i16 as i32) as u32,
+                        (16, false) => x & 0xffff,
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(out[0][lane as usize * 16 + slot], expected,
+                        "{label}: lane={lane} source={source:#x} slot={slot}");
+                }
+                assert_eq!(out[0][lane as usize * 16 + 12], (value >> 16) & 0xffff,
+                    "{label}: dynamic LDS byte address");
+                assert_eq!(out[0][lane as usize * 16 + 13], value,
+                    "{label}: original source word was not preserved");
+                assert_eq!(out[0][lane as usize * 16 + 14], value,
+                    "{label}: full LDS word was not preserved");
+                assert!(out[0][lane as usize * 16 + 15..lane as usize * 16 + 16]
+                    .iter().all(|&x| x == 0), "{label}: overwritten neighboring output");
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "NVIDIA/WARP numerical device required");
+}
+
+/// A native halfword store must preserve the neighboring 16 bits of the
+/// underlying dword. The actual scene uses this to build an LDS image tile,
+/// with separate lanes owning adjacent halfwords.
+#[test]
+fn native_lds_halfword_writes_preserve_other_half() {
+    let mut words = vec![s_mov_b32(5, 128)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.push(vop2(0x1a, 2, 130, 0)); // each thread's LDS dword
+    words.push(vop1(1, 3, sgpr(0)));
+    words.push(vop2(0x25, 3, vgpr(0), 3));
+    words.extend([0xD8340000, 0x00000302]); // full original dword
+    words.push(vop2(0x1a, 5, 132, 0)); // output stride 16 bytes
+    words.push(vop1(1, 4, sgpr(1)));
+    words.extend([0xD87C0002, 0x00000402]); // ds_write_b16 v2,v4 offset2
+    words.extend([0xD8D80000, 0x04000002]); // read full word
+    words.extend(buffer_store_dword_offen(4, 5, 8));
+    words.push(vop1(1, 4, sgpr(2)));
+    words.extend([0xD87C0000, 0x00000402]); // ds_write_b16 v2,v4 offset0
+    words.extend([0xD8D80000, 0x04000002]);
+    let mut store = buffer_store_dword_offen(4, 5, 8);
+    store[0] |= 4;
+    words.extend(store);
+    let mut store = buffer_store_dword_offen(3, 5, 8);
+    store[0] |= 8;
+    words.extend(store);
+    words.push(S_ENDPGM);
+    let shader = build_cs_config(&words, 32, false, 512, false);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = match host.compute_pipeline(&shader) {
+            Ok(p) => p,
+            Err(e) if warp => { eprintln!("WARP lacks LDS halfword pipeline support: {e}"); continue },
+            Err(e) => panic!("{label}: halfword LDS PSO: {e}"),
+        };
+        for (original, high, low) in [
+            (0x1122_3344u32, 0x5566_abcd, 0x7788_9911),
+            (0xffff_0000, 0x0000_8001, 0x0000_00fe),
+            (0x80fe_7f81, 0xabcd_ff00, 0x1234_beef),
+        ] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => match u.dword {0=>original, 1=>high, 2=>low, _=>0},
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected LDS halfword root {other:?}"),
+                };
+            }
+            let out = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(32 * 4)], samplers: &[], groups: [1, 1, 1],
+            }).unwrap_or_else(|e| panic!("{label}: LDS halfword dispatch: {e}"));
+            for lane in 0..32usize {
+                let word = original.wrapping_add(lane as u32);
+                let after_high = word & 0xffff | ((high & 0xffff) << 16);
+                let after_low = after_high & 0xffff_0000 | (low & 0xffff);
+                assert_eq!(&out[0][lane * 4..lane * 4 + 4],
+                    &[after_high, after_low, word, 0],
+                    "{label}: lane={lane}, halfword stores must preserve the other half");
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "NVIDIA/WARP LDS halfword device required");
+}
+
+/// Two neighboring lanes write opposite halves of the same shared dword,
+/// then the whole 64-thread group observes it after a real group barrier.
+/// This catches lost writes from non-atomic whole-dword emulation and tests
+/// the two-host-wave interleaving that the original wave64 tile exposes.
+#[test]
+fn native_lds_adjacent_halfword_writes_survive_cross_wave_barrier() {
+    let mut words = vec![s_mov_b32(5, 128)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.push(vop2(0x1a, 2, 129, 0)); // byte address = thread ID * 2
+    words.push(vop1(1, 3, sgpr(0)));
+    words.push(vop2(0x25, 3, vgpr(0), 3)); // one distinct halfword per lane
+    words.extend([0xD87C0000, 0x00000302]); // ds_write_b16 v2,v3
+    words.push(0xBF8A0000); // s_barrier: whole group after both waves wrote
+    words.extend([0xD8D80000, 0x04000002]); // ds_read_b32 v4,v2
+    words.push(vop2(0x1a, 5, 130, 0)); // output dword for each lane
+    words.extend(buffer_store_dword_offen(4, 5, 8));
+    words.push(S_ENDPGM);
+    let shader = build_cs_config(&words, 64, false, 512, false);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = match host.compute_pipeline(&shader) {
+            Ok(p) => p,
+            Err(e) if warp => { eprintln!("WARP lacks cross-wave LDS pipeline: {e}"); continue },
+            Err(e) => panic!("{label}: LDS group barrier pipeline: {e}"),
+        };
+        for initial in [0x80fe7f81u32, 0x7fff_ffff, 0xffff_0000] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) if u.dword == 0 => initial,
+                    (RootType::Constants, 0) => 0,
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected group LDS root {other:?}"),
+                };
+            }
+            let out = host.dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)], samplers: &[], groups: [1, 1, 1],
+            }).unwrap_or_else(|e| panic!("{label}: halfword group dispatch: {e}"));
+            for lane in 0..64usize {
+                let pair = (lane / 2) as u32 * 2;
+                let lo = initial.wrapping_add(pair) & 0xffff;
+                let hi = initial.wrapping_add(pair + 1) & 0xffff;
+                assert_eq!(out[0][lane], lo | (hi << 16),
+                    "{label}: lane={lane} after group LDS rendezvous");
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "a hardware LDS group-barrier device is required");
+}
+
 /// The native 8x8 filter's two center planes, four-column halo, and
 /// two-iteration symmetric six-pair LDS consumer. Integer data keeps the
 /// expected answer exact; the native filter's address proof is exercised.

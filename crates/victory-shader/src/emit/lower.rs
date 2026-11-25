@@ -4948,8 +4948,10 @@ impl<'a> Lower<'a> {
             let byte = self.s.m.bin(c, Bin::Add, a, add);
             let three = self.s.m.i32(3);
             let within = self.s.m.bin(c, Bin::And, byte, three);
-            let eight = self.s.m.i32(8);
-            let shift = self.s.m.bin(c, Bin::Shl, within, eight);
+            // The byte position is multiplied by eight bits, not shifted
+            // by eight positions (which would move byte 1 by 256 bits).
+            let bit_scale = self.s.m.i32(3);
+            let shift = self.s.m.bin(c, Bin::Shl, within, bit_scale);
             let val = self.vgprs(inst, data.first().ok_or("half LDS store data")?, 1)?[0];
             let mask = self.s.m.i32(0xffff);
             let x = self.s.m.bin(c, Bin::And, val, mask);
@@ -4961,6 +4963,39 @@ impl<'a> Lower<'a> {
             self.s.m.atomic(self.cur, super::bitcode::Rmw::And, p, keep);
             self.s.m.atomic(self.cur, super::bitcode::Rmw::Or, p, x);
             self.end_guarded(at, &[]);
+            return Ok(());
+        }
+        // LDS byte and halfword loads are byte-addressed, unlike our i32
+        // group-shared backing. Read the containing dword, select its low
+        // or high subword and extend exactly as the native opcode requests.
+        // The native LDS halfword address is naturally aligned; like the
+        // existing dword path, group-shared addresses must be in bounds.
+        if let Some((bits, signed)) = match name {
+            "ds_read_u8" => Some((8, false)),
+            "ds_read_i8" => Some((8, true)),
+            "ds_read_u16" => Some((16, false)),
+            "ds_read_i16" => Some((16, true)),
+            _ => None,
+        } {
+            let reg = dst_reg.ok_or("an LDS narrow read result")?;
+            let p = dword(self, offset);
+            let o = self.s.m.i32(offset);
+            let byte = self.s.m.bin(c, Bin::Add, a, o);
+            let three = self.s.m.i32(3);
+            let within = self.s.m.bin(c, Bin::And, byte, three);
+            let bit_scale = self.s.m.i32(3);
+            let shift = self.s.m.bin(c, Bin::Shl, within, bit_scale);
+            let word = self.s.m.load(c, p);
+            let x = self.s.m.bin(c, Bin::LShr, word, shift);
+            let x = if signed {
+                let shift = self.s.m.i32(32 - bits);
+                let x = self.s.m.bin(c, Bin::Shl, x, shift);
+                self.s.m.bin(c, Bin::AShr, x, shift)
+            } else {
+                let mask = self.s.m.i32((1u32 << bits) - 1);
+                self.s.m.bin(c, Bin::And, x, mask)
+            };
+            self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("ds_read") {

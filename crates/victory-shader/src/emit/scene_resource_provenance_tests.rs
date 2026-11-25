@@ -353,3 +353,48 @@ fn original_scene_half_bias_2d_pixel_validates() {
             .expect("original prison mesh+pixel graphics pipeline on NVIDIA");
     }
 }
+
+/// Native u16 LDS reads occur nine times in this original scene compute
+/// shader. A prior deferred failure surfaced at the final image_store.
+#[test]
+fn original_scene_narrow_lds_read_compute_validates() {
+    let Some(dir) = std::env::var_os("VICTORY_MESH_DESCRIPTOR_DIR") else { return };
+    let bytes = std::fs::read(std::path::PathBuf::from(dir)
+        .join("compute-e535cfd7baac93b8.cso")).expect("original compute fixture");
+    let c = Container::parse(&bytes).unwrap();
+    let native = crate::native_programs(c.part(FourCC::DXIL).unwrap().data)
+        .unwrap().into_iter().find(|n| n.stage == HwStage::Cs).unwrap();
+    let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+    let narrow: Vec<_> = p.blocks.iter().flat_map(|bb| &bb.insts)
+        .filter(|i| i.name().starts_with("ds_read"))
+        .collect();
+    assert_eq!(narrow.iter().map(|i| i.machine.offset).collect::<Vec<_>>(),
+        [0x1c0, 0x1c8, 0x1d0, 0x1d8, 0x1e0, 0x298, 0x2a0, 0x2a8, 0x2b0]);
+    for i in narrow {
+        assert_eq!(i.name(), "ds_read_u16");
+        assert!(matches!(i.fields, crate::gfx10::Fields::Ds {
+            addr: Some(crate::gfx10::Operand::Vector { reg: 0, dwords: 1 }),
+            gds: false, offset1: 0, .. }));
+    }
+    let at = p.blocks.iter().flat_map(|bb| &bb.insts)
+        .find(|i| i.machine.offset == 0x50c).expect("original narrow LDS site");
+    assert_eq!(at.name(), "image_store", "deferred error is reported on the consumer");
+    let shader = super::translate(&bytes).expect("native halfword LDS reads must translate");
+    let mut dxil = shader.dxil.clone();
+    let mut validator = super::validator::Validator::load(
+        super::validator::Validator::default_path().as_deref()).expect("Microsoft DXIL validator");
+    validator.validate(&mut dxil).expect("original LDS read compute DXIL");
+    assert!(native.wave64, "the original native wave64 requirement remains");
+    assert!(matches!(native.io, crate::native::StageIo::Cs(cs)
+        if cs.threads == [8, 8, 1] && cs.lds_bytes() == 512));
+    let host = super::host::Host::new(false).expect("NVIDIA SM6.6 device");
+    host.root_signature_for(&[(&shader,
+        windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_ALL)])
+        .expect("native shader root layout accepted by NVIDIA");
+    // DXIL translation and root-signature validation do not waive its
+    // wave64 group-ordered LDS dependence. A wave32 PSO needs a separately
+    // certified 100-halfword tile rendezvous and global alias/order proof.
+    if let Err(reason) = host.compute_pipeline(&shader) {
+        eprintln!("original narrow-LDS compute PSO remains wave64-guarded: {reason}");
+    }
+}
