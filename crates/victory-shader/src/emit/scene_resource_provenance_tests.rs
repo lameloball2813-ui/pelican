@@ -149,3 +149,72 @@ fn original_scene_a7a20_separate_dimension_loads_audit() {
     assert!(matches!(super::translate(&bytes), Err(ShaderError::Unsupported { .. })),
         "this audit must be retired or upgraded when the real original pixel shader is supported");
 }
+
+/// These original mesh programs lose visible geometry when their sampler
+/// descriptor is assembled from computed per-lane VGPRs. Nearby native loads
+/// alone do not certify their SSA origins or EXEC coverage. Preserve exact
+/// failure sites until a full incoming-word/path proof is available.
+#[test]
+fn original_scene_mesh_sampler_provenance_remains_guarded() {
+    let Some(dir) = std::env::var_os("VICTORY_MESH_DESCRIPTOR_DIR") else { return };
+    for (hash, site) in [
+        ("adc5c689b0552cc2", 0x5ba8usize),
+        ("903776ba469c8bac", 0x57b4),
+        ("89a622617919c92a", 0x5fe8),
+        ("fb5e4cf7091f9525", 0x5b84),
+    ] {
+        let bytes = std::fs::read(std::path::PathBuf::from(&dir)
+            .join(format!("mesh-{hash}.cso"))).expect("original missing scene mesh shader");
+        let c = Container::parse(&bytes).unwrap();
+        let native = crate::native_programs(c.part(FourCC::DXIL).unwrap().data)
+            .unwrap().into_iter().find(|n| n.stage == HwStage::Ms).unwrap();
+        let (p, structured) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)
+            .expect("real mesh SSA");
+        let err = crate::resource::track(&p, &native.layout, native.stage, structured.as_ref().ok())
+            .expect_err("unproven sampler descriptor must stay rejected");
+        assert_eq!(err, ShaderError::Unsupported {
+            offset: site,
+            what: "a descriptor read from the first lane of computed VGPRs",
+        }, "{hash}: do not recover geometry with an unproven sampler");
+        let at = p.blocks.iter().flat_map(|bb| &bb.insts)
+            .find(|i| i.machine.offset == site).expect("original sample offset");
+        assert!(at.name().starts_with("image_sample"), "{hash}: {}", at.name());
+        if hash == "adc5c689b0552cc2" {
+            let instr = |offset| p.blocks.iter().flat_map(|bb| &bb.insts)
+                .find(|i| i.machine.offset == offset).expect("original sampler instruction");
+            let load_a = instr(0x5218);
+            let load_b = instr(0x5994);
+            assert_eq!((load_a.name(), load_b.name()), ("s_load_dwordx4", "s_load_dwordx4"));
+            assert_eq!(load_a.fields, load_b.fields, "same native sampler offset");
+            for reg in [24u8, 25] {
+                assert_eq!(load_a.read(crate::ir::Reg::S(reg)),
+                    load_b.read(crate::ir::Reg::S(reg)),
+                    "same scalar root-pointer SSA, not merely matching SGPR numbers");
+            }
+            // The later four readfirstlane operands are *not* scalar copies
+            // of these loads. They are phis at block 190, containing the
+            // branch at block 183 and the alternative block 189. At block
+            // 183, one incoming path still holds geometry calculations.
+            // EXEC coverage, not identical load addresses, must prove which
+            // lanes actually observe the sampler writes.
+            for reg in 76u8..80 {
+                let firstlane = instr(0x5b78 + usize::from(reg - 76) * 4);
+                assert_eq!(firstlane.name(), "v_readfirstlane_b32");
+                let value = firstlane.read(crate::ir::Reg::V(reg)).unwrap();
+                let joined = p.blocks[190].phis.iter()
+                    .find(|phi| phi.value == value && phi.reg == crate::ir::Reg::V(reg))
+                    .expect("per-lane descriptor is still a control-flow phi");
+                assert_eq!(joined.args.len(), 2);
+            }
+            let first = instr(0x5b78).read(crate::ir::Reg::V(76)).unwrap();
+            let source = p.blocks[190].phis.iter().find(|phi| phi.value == first).unwrap();
+            let earlier = source.args[0];
+            let inner = p.blocks[183].phis.iter().find(|phi| phi.value == earlier).unwrap();
+            let geometry = inner.args[0];
+            let defining = p.blocks.iter().flat_map(|bb| &bb.insts)
+                .find(|i| i.writes.iter().any(|&(_, v)| v == geometry)).unwrap();
+            assert_eq!(defining.name(), "v_sub_f32",
+                "unwritten lanes still carry geometry, not a sampler word");
+        }
+    }
+}

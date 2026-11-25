@@ -3200,6 +3200,59 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert!(states(&fresh).is_empty());
     }
 
+    /// Isolates command-recording locks, not runtime shader/GPU or title
+    /// write-watch costs. Intentionally ignored in the ordinary suite.
+    #[test]
+    #[ignore = "CPU microbenchmark; run without a game process"]
+    fn original_heap_read_lock_batch_microbenchmark() {
+        let Some(host) = super::host() else { return };
+        const SHADOWS: usize = 32;
+        const INTERVALS: usize = 16;
+        const REPEATS: usize = 128;
+        const BASE: u64 = 0x1d1300000;
+        struct Unregister;
+        impl Drop for Unregister {
+            fn drop(&mut self) {
+                for i in 0..SHADOWS {
+                    crate::shadow::unregister(0x73100 + i, BASE + i as u64 * 65536);
+                }
+            }
+        }
+        let _unregister = Unregister;
+        let mut ranges = Vec::new();
+        for i in 0..SHADOWS {
+            let start = BASE + i as u64 * 65536;
+            crate::shadow::register(0x73100 + i, start, 4096);
+            let shadow = crate::shadow::find(start, 4096).expect("benchmark shadow");
+            let intervals = (0..INTERVALS)
+                .map(|j| (start + j as u64 * 128, start + j as u64 * 128 + 64))
+                .collect();
+            ranges.push((shadow, intervals));
+        }
+        let scalar = host.new_list().expect("scalar benchmark list");
+        let bulk = host.new_list().expect("bulk benchmark list");
+        let run_scalar = || {
+            for (shadow, _) in &ranges { shadow.ensure_state(&scalar, 0x40 | 0x80); }
+            for (shadow, intervals) in &ranges {
+                for &(from, to) in intervals { shadow.refresh(&scalar, from, to - from); }
+            }
+        };
+        let run_bulk = || {
+            bulk.ensure_shadow_read_states(&ranges);
+            bulk.defer_refresh_run(&ranges);
+        };
+        run_scalar(); run_bulk();
+        let start = std::time::Instant::now();
+        for _ in 0..REPEATS { run_scalar(); }
+        let scalar_us = start.elapsed().as_micros();
+        let start = std::time::Instant::now();
+        for _ in 0..REPEATS { run_bulk(); }
+        let bulk_us = start.elapsed().as_micros();
+        println!("{SHADOWS} shadows x {INTERVALS} intervals x {REPEATS} read runs: scalar {scalar_us}us, batched {bulk_us}us; synthetic recording only");
+        assert_eq!(scalar.deferred().refreshed.0, bulk.deferred().refreshed.0);
+        assert_eq!(scalar.buffer_states.lock().unwrap().len(), bulk.buffer_states.lock().unwrap().len());
+    }
+
     #[test]
     fn recorded_range_coverage_matches_byte_oracle() {
         use super::RangeCoverage;
