@@ -2256,10 +2256,14 @@ fn writeback_pages(base: usize, runs: &[(usize, usize)], mut page: impl FnMut(&[
     const PAGE: usize = 64 << 10;
     let mut at = 0;
     let mut from = runs.first().map(|r| r.0).unwrap_or(0);
+    // Reuse scratch across section pages. Each callback consumes the exact
+    // ordered interval slice before it is cleared for the next page;
+    // neither title bytes nor physical alias validation are cached.
+    let mut group = Vec::new();
     while at < runs.len() {
         let Some(address) = base.checked_add(from) else { return; };
         let boundary = address / PAGE;
-        let mut group = Vec::new();
+        group.clear();
         loop {
             let (_, end) = runs[at];
             // Use subtraction rather than rounding a VA upward: no overflow
@@ -3299,6 +3303,59 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         }
         assert_eq!(seen.iter().map(|&v| v != 0).collect::<Vec<_>>(), expected);
         assert!(seen.iter().all(|&v| v <= 1), "each changed byte written exactly once");
+    }
+
+    #[test]
+    fn reused_writeback_page_scratch_matches_original_partition_for_sparse_runs() {
+        const PAGE: usize = 64 << 10;
+        let base = PAGE * 3 + PAGE / 2 + 13;
+        // Include untouched pages, sparse runs, and runs crossing several
+        // page boundaries. Never expand a group to include an unwritten gap.
+        let runs = [
+            (0, 1), (20, 23), (PAGE - 7, PAGE + 8),
+            (2 * PAGE + 20, 2 * PAGE + 31),
+            (3 * PAGE - 4, 4 * PAGE + 6),
+            (7 * PAGE + 1, 7 * PAGE + 3),
+        ];
+        let mut original = Vec::<Vec<(usize,usize)>>::new();
+        for &(from, to) in &runs {
+            let mut at = from;
+            while at < to {
+                let address = base + at;
+                let n = (PAGE - address % PAGE).min(to - at);
+                let group = original.last_mut().filter(|g|
+                    (base + g[0].0) / PAGE == address / PAGE);
+                if let Some(g) = group { g.push((at, at+n)); }
+                else { original.push(vec![(at, at+n)]); }
+                at += n;
+            }
+        }
+        let mut actual = Vec::new();
+        let mut observed = vec![0x33u8; 8 * PAGE];
+        super::writeback_pages(base, &runs, |group| {
+            // Mutating simulated title memory between page callbacks must
+            // never affect what byte intervals the next callback receives.
+            if let Some(last) = actual.last().and_then(|g: &Vec<(usize,usize)>| g.last()) {
+                observed[last.1] = 0x99;
+            }
+            actual.push(group.to_vec());
+        });
+        assert_eq!(actual, original);
+        for group in &actual {
+            for &(from, to) in group { observed[from..to].fill(0xd7); }
+        }
+        let mut reference = vec![0x33u8; 8 * PAGE];
+        for group in &original {
+            for &(from,to) in group { reference[from..to].fill(0xd7); }
+        }
+        for group in original.iter().take(original.len().saturating_sub(1)) {
+            if let Some(&(_, end)) = group.last() {
+                if !runs.iter().any(|&(from, to)| from <= end && end < to) {
+                    reference[end] = 0x99;
+                }
+            }
+        }
+        assert_eq!(observed, reference);
     }
 
     #[test]
