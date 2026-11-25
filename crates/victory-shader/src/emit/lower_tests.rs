@@ -9,6 +9,25 @@
     const S_ENDPGM: u32 = 0xBF81_0000;
 
     #[test]
+    fn half_bias_sample_requires_exact_native_two_word_layout() {
+        let supported = super::certified_half_bias_2d;
+        assert!(supported(true, "image_sample_b", 1, false, 2));
+        for (a16, name, dim, unorm, words) in [
+            (false, "image_sample_b", 1, false, 2),
+            (true, "image_sample_b_cl", 1, false, 2),
+            (true, "image_sample_b_o", 1, false, 2),
+            (true, "image_sample_b", 0, false, 2),
+            (true, "image_sample_b", 4, false, 2),
+            (true, "image_sample_b", 1, true, 2),
+            (true, "image_sample_b", 1, false, 1),
+            (true, "image_sample_b", 1, false, 3),
+        ] {
+            assert!(!supported(a16, name, dim, unorm, words),
+                "unsupported sampling layout must not infer packed UV offsets");
+        }
+    }
+
+    #[test]
     fn mesh_rendezvous_requires_every_path_exactly_once() {
         use super::{once_only_rendezvous, LaneExit, Bool};
         let branch = |taken, not_taken| LaneExit::Branch { when: Bool::TRUE, taken, not_taken };

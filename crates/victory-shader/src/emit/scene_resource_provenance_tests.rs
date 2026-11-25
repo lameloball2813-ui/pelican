@@ -308,3 +308,37 @@ fn original_scene_compute_constant_slot_addresses_stay_guarded() {
             "{hash}: original root-pointer refusal changed");
     }
 }
+
+/// In a16 image_sample_b (ordinary normalized 2D only), the native bias
+/// occupies one whole VGPR whose low half is f16. The following VGPR packs
+/// both UV coordinates. This original prison-opening shader exercises the
+/// exact form; its bytes remain outside the source repository.
+#[test]
+fn original_scene_half_bias_2d_pixel_validates() {
+    let Some(dir) = std::env::var_os("VICTORY_PIXEL_DESCRIPTOR_DIR") else { return };
+    let bytes = std::fs::read(std::path::PathBuf::from(dir)
+        .join("pixel-16400b2f082a2006.cso")).expect("original prison pixel fixture");
+    let c = Container::parse(&bytes).unwrap();
+    let native = crate::native_programs(c.part(FourCC::DXIL).unwrap().data)
+        .unwrap().into_iter().find(|n| n.stage == HwStage::Ps).unwrap();
+    let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+    let at = |offset| p.blocks.iter().flat_map(|bb| &bb.insts)
+        .find(|i| i.machine.offset == offset).expect("original native sample site");
+    assert_eq!(at(0x15c).name(), "image_sample_b");
+    assert!(matches!(&at(0x15c).fields,
+        crate::gfx10::Fields::Image { dim: 1, a16: true, unorm: false,
+            addr, .. } if matches!(addr.as_slice(),
+                [crate::gfx10::Operand::Vector { reg: 5, dwords: 2 }])));
+    assert_eq!(at(0x11c).name(), "v_mov_b32", "original bias low half");
+    assert_eq!(at(0x12c).name(), "v_pack_b32_f16", "original packed UV");
+    let shader = super::translate(&bytes)
+        .unwrap_or_else(|e| panic!("original a16 sample_bias should translate: {e}"));
+    let mut dxil = shader.dxil.clone();
+    let mut validator = super::validator::Validator::load(
+        super::validator::Validator::default_path().as_deref()).expect("DXIL validator");
+    validator.validate(&mut dxil).expect("original a16 sampleBias DXIL validity");
+    let host = super::host::Host::new(false).expect("NVIDIA SM6.6 device");
+    host.root_signature_for(&[(&shader,
+        windows::Win32::Graphics::Direct3D12::D3D12_SHADER_VISIBILITY_PIXEL)])
+        .expect("original a16 sampleBias root layout");
+}

@@ -353,6 +353,11 @@ pub(crate) fn lower_with_static_cbvs(parts: &Parts, static_cbvs: bool) -> Result
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
+/// Whole bias dword followed by one packed f16 UV dword. Other dimensions,
+/// offsets, array slices and clamped bias operations have different layouts.
+fn certified_half_bias_2d(a16: bool, name: &str, dim: u8, unorm: bool, words: usize) -> bool {
+    a16 && name == "image_sample_b" && dim == 1 && !unorm && words == 2
+}
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
 
@@ -9077,9 +9082,6 @@ impl<'a> Lower<'a> {
             return Err("an image access with tfe or lwe");
         }
         let name = inst.name();
-        if *a16 && name.starts_with("image_sample_b") {
-            return Err("a biased image sample with 16-bit coordinates");
-        }
         // A load or sample with no channel enabled returns the first.
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
@@ -9107,6 +9109,15 @@ impl<'a> Lower<'a> {
             if let Operand::Vector { reg, dwords } = *a {
                 regs.extend((0..dwords).map(|k| reg + k));
             }
+        }
+        // Native a16 sample_b reserves an entire VGPR for bias (only its
+        // low f16 is read), followed by coordinates packed two per VGPR.
+        // Do not treat the unused high half of the bias as coordinate U.
+        // Certify only the normal 2D form; array, clamp, offset, comparison
+        // and other biased formats still require separate address proofs.
+        let half_bias_2d = certified_half_bias_2d(*a16, name, *dim, *unorm, regs.len());
+        if *a16 && name.starts_with("image_sample_b") && !half_bias_2d {
+            return Err("a biased image sample with 16-bit coordinates");
         }
         // With a16, two 16-bit components per VGPR, low half first.
         let addr_val = |l: &mut Self, k: usize| -> Result<V, Why> {
@@ -9410,7 +9421,11 @@ impl<'a> Lower<'a> {
                 }
             };
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
-                let x = addr_val(self, first + grads + k)?;
+                // The bias occupies an entire native word, even with a16.
+                // Its high half is padding: U and V are at packed half-word
+                // indices 2 and 3, not 1 and 2.
+                let addr_index = if half_bias_2d { 2 + k } else { first + grads + k };
+                let x = addr_val(self, addr_index)?;
                 *slot = to_float(self, x);
             }
             let cube_face = cs[2];
@@ -9502,7 +9517,8 @@ impl<'a> Lower<'a> {
                 }
                 61 => {
                     let bias = addr_val(self, 0)?;
-                    let bias = self.as_float(bias);
+                    let bias = if half_bias_2d { to_float(self, bias) }
+                        else { self.as_float(bias) };
                     args.extend(&os);
                     args.extend([bias, clamp]);
                     self.s.op(
