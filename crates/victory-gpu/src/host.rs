@@ -708,9 +708,15 @@ fn record_refresh_run(
     ranges: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(u64, u64)>)],
 ) {
     for (shadow, intervals) in ranges {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
+        // Keep one map entry across adjacent intervals of the same shadow.
+        // Preserve every original Step::Refresh and its source order.
+        let covered = deferred.refreshed.0.entry(key).or_default();
         for &(start, end) in intervals {
             let len = (end - start).min(shadow.left(start));
-            deferred.record_refresh(shadow, start as usize, len as usize);
+            if RangeCoverage::insert_into(covered, start as usize, len as usize) {
+                deferred.copies.push(Step::Refresh(shadow.clone(), start as usize, len as usize));
+            }
         }
     }
 }
@@ -727,9 +733,12 @@ impl RangeCoverage {
     /// Keep partially new requests intact, including their original position
     /// relative to snapshot declarations and other shadows.
     fn insert(&mut self, key: usize, from: usize, len: usize) -> bool {
+        Self::insert_into(self.0.entry(key).or_default(), from, len)
+    }
+
+    fn insert_into(ranges: &mut Vec<(usize, usize)>, from: usize, len: usize) -> bool {
         let Some(to) = from.checked_add(len) else { return false };
         if from == to { return false; }
-        let ranges = self.0.entry(key).or_default();
         let i = ranges.partition_point(|&(_, end)| end <= from);
         if ranges.get(i).is_some_and(|&(a,b)| a <= from && to <= b) {
             return false;
@@ -3339,6 +3348,77 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         println!("{SHADOWS} shadows x {INTERVALS} intervals x {REPEATS} read runs: scalar {scalar_us}us, batched {bulk_us}us; synthetic recording only");
         assert_eq!(scalar.deferred().refreshed.0, bulk.deferred().refreshed.0);
         assert_eq!(scalar.buffer_states.lock().unwrap().len(), bulk.buffer_states.lock().unwrap().len());
+    }
+
+    /// Cold coverage and saturated coverage differ substantially in the
+    /// original title. This benchmark avoids GPU lists and 4,000 D3D buffer
+    /// allocations: it uses original-identity shadow mirrors and exact
+    /// deferred steps, clearing coverage at every simulated title-write
+    /// epoch. No frame-time claim is implied by its elapsed times.
+    #[test]
+    #[ignore = "CPU microbenchmark; run without a game process"]
+    fn original_heap_refresh_cold_epoch_microbenchmark() {
+        const SHADOWS: usize = 512;
+        const INTERVALS: usize = 16;
+        const EPOCHS: usize = 8;
+        const BASE: u64 = 0x1d3400000;
+        struct Unregister;
+        impl Drop for Unregister {
+            fn drop(&mut self) {
+                for i in 0..SHADOWS {
+                    crate::shadow::unregister(0x75100 + i, BASE + i as u64 * 65536);
+                }
+            }
+        }
+        let _unregister = Unregister;
+        let mut ranges = Vec::new();
+        for i in 0..SHADOWS {
+            let start = BASE + i as u64 * 65536;
+            crate::shadow::register(0x75100 + i, start, 4096);
+            let shadow = crate::shadow::find(start, 4096).expect("benchmark original shadow");
+            let intervals: Vec<(u64, u64)> = (0..INTERVALS).map(|j| {
+                let from = start + j as u64 * 128;
+                (from, from + 64)
+            }).collect();
+            ranges.push((shadow, intervals));
+        }
+        let mut scalar = super::Deferred::default();
+        let mut bulk = super::Deferred::default();
+        let start = std::time::Instant::now();
+        for _ in 0..EPOCHS {
+            for (shadow, intervals) in &ranges {
+                for &(from, to) in intervals {
+                    scalar.record_refresh(shadow, from as usize,
+                        (to - from).min(shadow.left(from)) as usize);
+                }
+            }
+            scalar.refreshed.clear();
+            scalar.copies.clear();
+        }
+        let scalar_us = start.elapsed().as_micros();
+        let start = std::time::Instant::now();
+        for _ in 0..EPOCHS {
+            super::record_refresh_run(&mut bulk, &ranges);
+            bulk.refreshed.clear();
+            bulk.copies.clear();
+        }
+        let bulk_us = start.elapsed().as_micros();
+        // A separate run proves exact steps, not only matching final coverage.
+        for (shadow, intervals) in &ranges {
+            for &(from, to) in intervals {
+                scalar.record_refresh(shadow, from as usize,
+                    (to - from).min(shadow.left(from)) as usize);
+            }
+        }
+        super::record_refresh_run(&mut bulk, &ranges);
+        let signature = |deferred: &super::Deferred| deferred.copies.iter().map(|s| match s {
+            super::Step::Refresh(shadow, from, len) =>
+                (std::sync::Arc::as_ptr(shadow) as usize, *from, *len),
+            _ => panic!("only original refresh steps expected"),
+        }).collect::<Vec<_>>();
+        assert_eq!(signature(&scalar), signature(&bulk));
+        assert_eq!(scalar.refreshed.0, bulk.refreshed.0);
+        println!("{SHADOWS} shadows x {INTERVALS} intervals x {EPOCHS} fresh epochs: scalar {scalar_us}us, hoisted {bulk_us}us; CPU recording only");
     }
 
     #[test]
