@@ -17,7 +17,37 @@ the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
 
-## Status (inherited from VIctory, 2026-11-23)
+## Development status (2026-11-24)
+
+**Experimental; not yet playable at normal speed.** The game boots, enters the
+world, and issues indirect draws, but much of the scene remains dark or missing.
+The 30 fps menu/start-screen result does **not** mean 30 fps in the world. There
+is no verified sustained 30 fps gameplay result, and ray-traced lighting and
+the full acceleration-structure builder are not yet validated end-to-end.
+
+### Recent Pelican changes
+
+- **Bindless texture dimensions:** a dimension-only GFX10 resource-heap load
+  can reconstruct a 2D texture's width and height using the *same descriptor's*
+  dynamic heap index and host-view dimensions. Two previously failing pixel
+  programs now produce DXIL that passes validation. Their appearance in the
+  actual game is **not yet confirmed**; bindless resource-type correctness
+  requires additional runtime testing.
+- **GPU and streaming:** streamed textures with partial residency can be
+  uploaded; shader-written buffers, resource descriptors, and asynchronous
+  runtime services have received fixes. See the [change history](PELICAN.md).
+- **Testing:** the bindless-dimension regression loads original shader
+  containers **from outside the repository** when
+  `VICTORY_PIXEL_DESCRIPTOR_DIR` points to them. It does not distribute game
+  data. A full shader-library run after the change passed **162 tests**, with
+  **1 ignored**; shader translation/validation does not prove visual quality.
+
+**Priority work:** restore missing materials and geometry, make ray-tracing
+construction stable and visually correct, reduce costly memory copies and
+paging, and then measure sustained world frame times on comparable scenes.
+Avoid improving the FPS number by skipping essential rendering.
+
+### Earlier VIctory baseline (2026-11-23)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and
 loads the world, where rendering fails.
@@ -30,7 +60,9 @@ loads the world, where rendering fails.
 | Loading into the world (about 50 s) | works |
 | The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
 
-Tested on one machine: Windows 11, AMD RX 6700 XT.
+The inherited baseline below was reported on Windows 11, AMD RX 6700 XT. Newer
+Pelican shader validation has also run on a Windows 11 RTX 5060 Ti system;
+these are not matched visual or performance benchmarks.
 
 > **Warning.** Entering the world on a real GPU can currently hang it, and
 > Windows then resets the display driver (every monitor goes black for a
@@ -54,6 +86,11 @@ What each part does today and what it still needs:
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
 ## Getting started
+
+This public repository contains **source code, not the game**. You must provide
+your own lawfully obtained, compatible files and keep them outside the Git
+working tree. Do not upload executables, original shader containers, captures,
+private configuration, or other proprietary title assets in issues or commits.
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
 shader model 6.6 (and mesh shaders for the world), Rust (pinned in
