@@ -157,14 +157,29 @@ fn wait(p: &Pending, frame: u64) {
     WAITED_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Number of concurrent GPU-driver shader compiles. An explicit limit bounds
+/// concurrent driver/compiler work when available system commit is small.
+/// This changes only when
+/// pipelines become available, not their bytecode or execution semantics.
+fn worker_count(available: usize, override_value: Option<&str>) -> usize {
+    let default = (available / 2).clamp(2, 8);
+    override_value
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| (1..=8).contains(&n))
+        .unwrap_or(default)
+}
+
+/// Hands `p` to the workers, started on first use.
 fn queue(p: Arc<Pending>) {
     static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
     let sender = SENDER.get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
         let receiver = Arc::new(Mutex::new(receiver));
-        let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let workers = worker_count(
+            std::thread::available_parallelism().map_or(4, |n| n.get()),
+            std::env::var("VICTORY_PIPELINE_WORKERS").ok().as_deref(),
+        );
+        tracing::info!(workers, "host pipeline compiler worker count");
         for i in 0..workers {
             let receiver = receiver.clone();
             let spawned = std::thread::Builder::new()
@@ -221,6 +236,17 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_count_override_is_bounded_and_invalid_values_keep_default() {
+        assert_eq!(worker_count(16, None), 8);
+        assert_eq!(worker_count(16, Some("2")), 2);
+        assert_eq!(worker_count(16, Some("1")), 1);
+        assert_eq!(worker_count(16, Some("0")), 8);
+        assert_eq!(worker_count(16, Some("9")), 8);
+        assert_eq!(worker_count(16, Some("invalid")), 8);
+        assert_eq!(worker_count(1, None), 2);
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
