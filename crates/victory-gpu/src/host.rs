@@ -2294,6 +2294,22 @@ fn direct_writes() -> bool {
 /// fall back to thousands of individual kernel writes.
 fn writeback_pages(base: usize, runs: &[(usize, usize)], mut page: impl FnMut(&[(usize, usize)])) {
     const PAGE: usize = 64 << 10;
+    // Shadow writeback already partitions GPU changes at these pages. When
+    // every sparse run belongs to one page, pass the borrowed run slice
+    // directly: never allocate/copy millions of two-byte intervals merely
+    // to reconstruct an identical group. The validated multi-page path
+    // below retains all exact offsets, gaps and overflow handling.
+    if let (Some(&(first, _)), Some(&(_, last))) = (runs.first(), runs.last()) {
+        if first < last
+            && let (Some(low), Some(high)) =
+                (base.checked_add(first), base.checked_add(last - 1))
+            && base.checked_add(last).is_some()
+            && low / PAGE == high / PAGE
+        {
+            page(runs);
+            return;
+        }
+    }
     let mut at = 0;
     let mut from = runs.first().map(|r| r.0).unwrap_or(0);
     // Reuse scratch across section pages. Each callback consumes the exact
@@ -2341,7 +2357,7 @@ pub(crate) fn write_mapped_runs(dst: *mut u8, src: &[u8], runs: &[(usize, usize)
     let writer = alias.then(|| PHYSICAL_WRITER.get()).flatten();
     let mut written = 0;
     #[cfg(feature = "diagnostics")]
-    let mut reasons = [0u64; PhysicalWriteRefusal::COUNT + 2];
+    let mut reasons = [[0u64; 4]; PhysicalWriteRefusal::COUNT + 2];
     #[cfg(feature = "diagnostics")]
     let mut successful = (0u64, 0u64, 0u64, 0u64);
     #[cfg(feature = "diagnostics")]
@@ -2377,7 +2393,11 @@ pub(crate) fn write_mapped_runs(dst: *mut u8, src: &[u8], runs: &[(usize, usize)
                 Err(reason) => {
                     #[cfg(feature = "diagnostics")]
                     {
-                        reasons[reason as usize] += 1;
+                        let bin = &mut reasons[reason as usize];
+                        bin[0] += 1;
+                        bin[1] += group.len() as u64;
+                        bin[2] += bytes;
+                        bin[3] += elapsed_us;
                         refused.3 += elapsed_us;
                     }
                     #[cfg(not(feature = "diagnostics"))]
@@ -2386,7 +2406,12 @@ pub(crate) fn write_mapped_runs(dst: *mut u8, src: &[u8], runs: &[(usize, usize)
             }
         } else {
             #[cfg(feature = "diagnostics")]
-            { reasons[PhysicalWriteRefusal::COUNT + usize::from(alias)] += 1; }
+            {
+                let bin = &mut reasons[PhysicalWriteRefusal::COUNT + usize::from(alias)];
+                bin[0] += 1;
+                bin[1] += group.len() as u64;
+                bin[2] += bytes;
+            }
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -3467,6 +3492,99 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         }
         assert_eq!(seen.iter().map(|&v| v != 0).collect::<Vec<_>>(), expected);
         assert!(seen.iter().all(|&v| v <= 1), "each changed byte written exactly once");
+    }
+
+    #[test]
+    fn borrowed_single_page_writeback_matches_original_and_keeps_all_gaps() {
+        const PAGE: usize = 64 << 10;
+        let single = (0..12_000usize).map(|i| (3 * i, 3 * i + 1)).collect::<Vec<_>>();
+        let base = 2 * PAGE + 17;
+        let mut parts = Vec::new();
+        let mut borrowed = false;
+        super::writeback_pages(base, &single, |group| {
+            borrowed |= std::ptr::eq(group.as_ptr(), single.as_ptr());
+            parts.push(group.to_vec());
+        });
+        assert!(borrowed, "single-page dispatch should not copy the run slice");
+        assert_eq!(parts, vec![single.clone()]);
+        let cases: &[(&[(usize, usize)], usize)] = &[
+            (&[], 0),
+            (&[(0,1),(4,5),(17,18)], PAGE + 4),
+            (&[(0,1),(4,5),(17,18)], PAGE - 10),
+            (&[(0,1),(PAGE-1,PAGE),(PAGE+1,PAGE+2)], 0),
+            (&[(0,2)], usize::MAX),
+            (&[(0,1)], usize::MAX),
+            (&[(0,PAGE)], PAGE),
+        ];
+        for &(runs, start) in cases {
+            let mut actual = Vec::new();
+            super::writeback_pages(start, runs, |group| actual.push(group.to_vec()));
+            let mut expected = Vec::<Vec<(usize,usize)>>::new();
+            for &(from, to) in runs {
+                let mut at = from;
+                while at < to {
+                    let Some(address) = start.checked_add(at) else { break };
+                    let n = (PAGE - address % PAGE).min(to - at);
+                    if let Some(group) = expected.last_mut().filter(|g|
+                        (start + g[0].0) / PAGE == address / PAGE) {
+                        group.push((at, at + n));
+                    } else { expected.push(vec![(at, at + n)]); }
+                    at += n;
+                }
+            }
+            assert_eq!(actual, expected, "partition mismatch for base {start:#x}");
+        }
+    }
+
+    #[test]
+    #[ignore = "CPU microbenchmark; run without a game process"]
+    fn sparse_single_page_writeback_dispatch_microbenchmark() {
+        const PAGE: usize = 64 << 10;
+        const RUNS: usize = 6000;
+        const REPEATS: usize = 500;
+        let base = 11 * PAGE + 37;
+        let sparse = (0..RUNS).map(|i| (i * 10, i * 10 + 1)).collect::<Vec<_>>();
+        let checksum = |runs: &[(usize, usize)]| runs.iter()
+            .fold(0u64, |x, &(a, b)| x.wrapping_add((b - a) as u64));
+        let original = |runs: &[(usize,usize)], callback: &mut dyn FnMut(&[(usize, usize)])| {
+            let mut at = 0;
+            let mut from = runs.first().map(|r| r.0).unwrap_or(0);
+            let mut group = Vec::new();
+            while at < runs.len() {
+                let Some(address) = base.checked_add(from) else { return; };
+                let boundary = address / PAGE;
+                group.clear();
+                loop {
+                    let (_, end) = runs[at];
+                    let Some(address) = base.checked_add(from) else { return; };
+                    let available = PAGE - (address % PAGE);
+                    let to = from + available.min(end - from);
+                    group.push((from, to));
+                    if to < end { from = to; break; }
+                    at += 1;
+                    if at == runs.len() { break; }
+                    from = runs[at].0;
+                    if base.checked_add(from).is_none_or(|address| address / PAGE != boundary) { break; }
+                }
+                callback(&group);
+            }
+        };
+        let mut reference = 0;
+        let started = std::time::Instant::now();
+        for _ in 0..REPEATS {
+            original(&sparse, &mut |group| reference += std::hint::black_box(checksum(group)));
+        }
+        let old_us = started.elapsed().as_micros();
+        let mut actual = 0;
+        let started = std::time::Instant::now();
+        for _ in 0..REPEATS {
+            super::writeback_pages(base, &sparse, |group|
+                actual += std::hint::black_box(checksum(group)));
+        }
+        let new_us = started.elapsed().as_micros();
+        assert_eq!(actual, reference);
+        assert_eq!(reference, (RUNS * REPEATS) as u64);
+        println!("{REPEATS} page dispatches x {RUNS} sparse changed runs: original {old_us} us, borrowed fast path {new_us} us; synthetic CPU grouping only");
     }
 
     #[test]
