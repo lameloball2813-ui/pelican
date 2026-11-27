@@ -1,5 +1,5 @@
-//! `pelican`: the command-line front end (the `victory` package, built as
-//! `pelican.exe`).
+//! `cool-fox`: the command-line front end (the `victory` package, built as
+//! `cool-fox.exe`).
 //!
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
-    name = "pelican",
+    name = "cool-fox",
     version,
     about = "Run an Xbox Series title natively on Windows"
 )]

@@ -264,16 +264,28 @@ pub struct UserData {
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    translate_with_static_cbvs(container, false)
+    translate_with_cbvs(container, CbvMode::Legacy)
 }
 
 /// Runtime variant: static CBVs use the packed root SRV ABI where proven.
 /// The legacy translation remains available for root-signature budget fallback.
 pub fn translate_static_cbvs(container: &[u8]) -> Result<HostShader, ShaderError> {
-    translate_with_static_cbvs(container, true)
+    translate_with_cbvs(container, CbvMode::Static)
 }
 
-fn translate_with_static_cbvs(container: &[u8], static_cbvs: bool) -> Result<HostShader, ShaderError> {
+/// Prefer the packed CBV ABI and reuse shader analysis if emission needs
+/// to retry with the legacy ABI.
+pub fn translate_prefer_static_cbvs(container: &[u8]) -> Result<HostShader, ShaderError> {
+    translate_with_cbvs(container, CbvMode::PreferStatic)
+}
+
+enum CbvMode {
+    Legacy,
+    Static,
+    PreferStatic,
+}
+
+fn translate_with_cbvs(container: &[u8], mode: CbvMode) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -304,7 +316,12 @@ fn translate_with_static_cbvs(container: &[u8], static_cbvs: bool) -> Result<Hos
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit_with_static_cbvs(&c, &native, &p, &st, &io, &res, static_cbvs)
+    let emit = |static_cbvs| emit_with_static_cbvs(&c, &native, &p, &st, &io, &res, static_cbvs);
+    match mode {
+        CbvMode::Legacy => emit(false),
+        CbvMode::Static => emit(true),
+        CbvMode::PreferStatic => emit(true).or_else(|_| emit(false)),
+    }
 }
 
 /// Emits a program whose earlier stages already ran.

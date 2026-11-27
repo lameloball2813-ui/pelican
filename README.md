@@ -1,14 +1,14 @@
-# Pelican
+# Cool Fox
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
-Pelican is a fork of [VIctory](https://github.com/Marvisak/VIctory) by
+Cool Fox is a fork of [VIctory](https://github.com/Marvisak/VIctory) by
 Marvisak and its contributors, and keeps its full history and its licence
-(GPL-3.0-or-later). All of VIctory's work is theirs; Pelican continues it.
+(GPL-3.0-or-later). All of VIctory's work is theirs; Cool Fox continues it.
 It is not an official VIctory release and is not endorsed by its authors.
 
-What Pelican changes is listed in [PELICAN.md](PELICAN.md). Package and crate
+What Cool Fox changes is listed in [PELICAN.md](PELICAN.md). Package and crate
 names (`victory-*`) and the `VICTORY_*` environment variables are kept as they
 are, so VIctory's changes keep merging in cleanly.
 
@@ -17,7 +17,31 @@ the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
 
-## Development status (2026-11-24)
+## Development status (2026-11-26)
+
+Cool Fox is the new name for Pelican. Build the public repository with
+`cargo build -p victory` to produce `cool-fox.exe`. The existing Pelican
+data and cache paths are still used, so current configurations and saves
+resolve to the same locations.
+
+### Latest public changes
+
+- Restored exact D16 depth-array UAV twins and synchronized the original
+  depth and color views across the whole array.
+- Added native LDS subword loads, A16 biased 2D sampling, and cube gradient
+  sampling for original scene shaders.
+- Reduced shadow refresh and sparse writeback work. Descriptor reads reuse
+  unchanged page plans, and shader translation reuses its analysis when
+  it falls back from packed constant buffers. Diagnostics report
+  local GPU usage, local GPU budget, and shared GPU usage separately.
+
+A separate RTX 5060 Ti test build averaged 8.2 FPS in sampled 4K prison
+gameplay with its in-place graphics heap option off and 6.2 FPS with it on.
+That build also exercised late bindless texture rechecks. Those measurements
+are for the separate experiment. The 25 FPS gameplay target and character
+shading issues remain open.
+
+### Earlier development status (2026-11-24)
 
 **Experimental; not yet playable at normal speed.** The game boots, enters the
 world, and issues indirect draws, but much of the scene remains dark or missing.
@@ -25,7 +49,7 @@ The 30 fps menu/start-screen result does **not** mean 30 fps in the world. There
 is no verified sustained 30 fps gameplay result, and ray-traced lighting and
 the full acceleration-structure builder are not yet validated end-to-end.
 
-### Recent Pelican changes
+### Recent Cool Fox changes
 
 - **Bindless texture dimensions:** a dimension-only GFX10 resource-heap load
   can reconstruct a 2D texture's width and height using the *same descriptor's*
@@ -61,7 +85,7 @@ loads the world, where rendering fails.
 | The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
 
 The inherited baseline below was reported on Windows 11, AMD RX 6700 XT. Newer
-Pelican shader validation has also run on a Windows 11 RTX 5060 Ti system;
+Cool Fox shader validation has also run on a Windows 11 RTX 5060 Ti system;
 these are not matched visual or performance benchmarks.
 
 > **Warning.** Entering the world on a real GPU can currently hang it, and
@@ -108,7 +132,7 @@ cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
 ```
 
-`pelican config` prints the resolved configuration and any asset-policy
+`cool-fox config` prints the resolved configuration and any asset-policy
 diagnostics. It exits with a nonzero status if any configured path fails
 the asset-policy check.
 
@@ -116,11 +140,11 @@ Run the title:
 
 ```powershell
 cargo build --release -p victory
-target\release\pelican.exe run <game dir>\<the title's exe> --execute
+target\release\cool-fox.exe run <game dir>\<the title's exe> --execute
 ```
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\pelican\data`), derived
+are kept under the existing Pelican data folder (default `%LOCALAPPDATA%\pelican\data`), derived
 data under the cache folder.
 
 Input: XInput pads. With none connected the keyboard is a pad while the
@@ -138,14 +162,14 @@ title's window has focus:
 ## Commands
 
 ```
-pelican inspect <exe|dll> [--imports] [--exports]
-pelican census [paths...] [--missing] [--strict]
-pelican lib-exports <import.lib> [--list]
-pelican shader-info [paths...] [--verbose] [--disasm]
-pelican translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-pelican run <exe> [--execute] [--unimplemented trap|zero] [--strict]
+cool-fox inspect <exe|dll> [--imports] [--exports]
+cool-fox census [paths...] [--missing] [--strict]
+cool-fox lib-exports <import.lib> [--list]
+cool-fox shader-info [paths...] [--verbose] [--disasm]
+cool-fox translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
+cool-fox run <exe> [--execute] [--unimplemented trap|zero] [--strict]
             [--console series-x|series-s] [-- <title arguments>]
-pelican config
+cool-fox config
 ```
 
 Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
@@ -156,7 +180,7 @@ info and above).
 A release build has no debugging aids. Build them in with
 
 ```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\pelican.exe
+cargo build --profile diag -p victory --features diagnostics   # target\diag\cool-fox.exe
 ```
 
 The on/off switches below (`...=1`) are off when unset or set to `0`.

@@ -16,7 +16,7 @@ test_titles = ["test-title"]
     std::fs::create_dir(root.join("game")).unwrap();
     std::fs::create_dir(root.join("test-title")).unwrap();
 
-    Command::new(env!("CARGO_BIN_EXE_pelican"))
+    Command::new(env!("CARGO_BIN_EXE_cool-fox"))
         .arg("config")
         .current_dir(root)
         .env("VICTORY_CONFIG", config)

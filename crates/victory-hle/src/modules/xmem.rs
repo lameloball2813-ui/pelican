@@ -687,12 +687,39 @@ pub unsafe fn write_physical_alias_runs(dst: *mut u8, src: &[u8], runs: &[(usize
     {
         use windows_sys::Win32::System::Memory::{MEM_MAPPED, PAGE_READWRITE, VirtualQuery};
         let (Some(&(first, _)), Some(&(_, last))) = (runs.first(), runs.last()) else { return Err(Refusal::InvalidRuns); };
-        if first >= last || runs.iter().any(|&(a,b)| a >= b || b > src.len()) || runs.windows(2).any(|p| p[0].1 > p[1].0) { return Err(Refusal::InvalidRuns); }
+        // Certify all runs before the first store, in a single pass. The
+        // dense sparse-write workload can contain millions of short runs.
+        let mut previous = first;
+        for &(a,b) in runs {
+            if a < previous || a >= b || b > src.len() { return Err(Refusal::InvalidRuns); }
+            previous = b;
+        }
         let (Some(start), Some(end)) = ((dst as usize).checked_add(first), (dst as usize).checked_add(last)) else { return Err(Refusal::AddressOverflow); };
         if start / PAGE != (end - 1) / PAGE { return Err(Refusal::CrossPage); }
         let p = physical();
         let Some((&base, (size, slice))) = p.views.range(..=start).next_back() else { return Err(Refusal::NoView); };
-        if base.checked_add(*size).is_none_or(|limit| end > limit) { return Err(Refusal::ViewExtent); }
+        if base.checked_add(*size).is_none_or(|limit| end > limit) {
+            #[cfg(feature = "diagnostics")]
+            {
+                // A predecessor outside the requested range is not an
+                // authoritative alias. Sample the actual kernel region to
+                // distinguish private allocations, holes and unregistered
+                // views without guessing a section offset or adding a
+                // VirtualQuery to every refused run.
+                static SAMPLES: AtomicUsize = AtomicUsize::new(0);
+                let sample = SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+                if sample.is_power_of_two() {
+                    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                    let queried = unsafe { VirtualQuery(start as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } != 0;
+                    tracing::info!(sample, queried, start = format_args!("{start:#x}"), end = format_args!("{end:#x}"),
+                        preceding_end = format_args!("{:#x}", base.saturating_add(*size)),
+                        allocation_base = format_args!("{:p}", info.AllocationBase), region_base = format_args!("{:p}", info.BaseAddress),
+                        region_bytes = info.RegionSize, state = info.State, kind = info.Type, protection = info.Protect,
+                        runs = runs.len(), "physical scatter destination outside registered view");
+                }
+            }
+            return Err(Refusal::ViewExtent);
+        }
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         if unsafe { VirtualQuery(start as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 { return Err(Refusal::QueryFailed); }
         if info.State != MEM_COMMIT { return Err(Refusal::NotCommitted); }
@@ -716,7 +743,11 @@ pub unsafe fn write_physical_alias_runs(dst: *mut u8, src: &[u8], runs: &[(usize
                 match b - a {
                     1 => core::arch::asm!("mov al, byte ptr [{s}]", "mov byte ptr [{d}], al", s = in(reg) from, d = in(reg) to, out("rax") _, options(nostack, preserves_flags)),
                     2 => core::arch::asm!("mov ax, word ptr [{s}]", "mov word ptr [{d}], ax", s = in(reg) from, d = in(reg) to, out("rax") _, options(nostack, preserves_flags)),
+                    3 => core::arch::asm!("mov ax, word ptr [{s}]", "mov word ptr [{d}], ax", "mov al, byte ptr [{s}+2]", "mov byte ptr [{d}+2], al", s = in(reg) from, d = in(reg) to, out("rax") _, options(nostack, preserves_flags)),
                     4 => core::arch::asm!("mov eax, dword ptr [{s}]", "mov dword ptr [{d}], eax", s = in(reg) from, d = in(reg) to, out("rax") _, options(nostack, preserves_flags)),
+                    5 => core::arch::asm!("mov eax, dword ptr [{s}]", "mov dword ptr [{d}], eax", "mov al, byte ptr [{s}+4]", "mov byte ptr [{d}+4], al", s = in(reg) from, d = in(reg) to, out("rax") _, options(nostack, preserves_flags)),
+                    6 => core::arch::asm!("mov eax, dword ptr [{s}]", "mov dword ptr [{d}], eax", "mov ax, word ptr [{s}+4]", "mov word ptr [{d}+4], ax", s = in(reg) from, d = in(reg) to, out("rax") _, options(nostack, preserves_flags)),
+                    7 => core::arch::asm!("mov eax, dword ptr [{s}]", "mov dword ptr [{d}], eax", "mov ax, word ptr [{s}+4]", "mov word ptr [{d}+4], ax", "mov al, byte ptr [{s}+6]", "mov byte ptr [{d}+6], al", s = in(reg) from, d = in(reg) to, out("rax") _, options(nostack, preserves_flags)),
                     8 => core::arch::asm!("mov rax, qword ptr [{s}]", "mov qword ptr [{d}], rax", s = in(reg) from, d = in(reg) to, out("rax") _, options(nostack, preserves_flags)),
                     n => core::arch::asm!("cld", "rep movsb", inout("rsi") from => _, inout("rdi") to => _, inout("rcx") n => _, options(nostack)),
                 }
@@ -1717,7 +1748,7 @@ mod tests {
         let src = vec![0x99; PAGE];
         let runs: Vec<_> = (0..128).map(|i| {
             let start = i * 33 + 1;
-            (start, start + [1, 2, 3, 4, 5, 8, 16, 31][i % 8])
+            (start, start + [1, 2, 3, 4, 5, 6, 7, 8, 16, 31][i % 10])
         }).chain(std::iter::once((PAGE - 1, PAGE))).collect();
         let write = |at: usize, runs: &[(usize, usize)]| {
             let _guard = victory_gpu::begin_kernel_write(at, PAGE, false);

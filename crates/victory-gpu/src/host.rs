@@ -161,10 +161,11 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
@@ -527,9 +528,15 @@ static LIVE_PRELUDES: AtomicU32 = AtomicU32::new(0);
 pub fn diagnostic_memory() {
     let [runtime_graphics_bytes, title_graphics_bytes] = crate::resource::memory_bytes();
     let (host_texture_bytes, host_texture_count) = crate::resource::host_texture_totals();
+    let [local, shared] = HOST.get().and_then(Option::as_ref)
+        .map(|host| host.video_memory_segments())
+        .unwrap_or_default();
     tracing::info!(runtime_graphics_bytes, title_graphics_bytes,
         texture_staging_bytes = crate::texture::staging_bytes(),
         host_texture_bytes, host_texture_count,
+        local_gpu_usage_bytes = ?local.map(|m| m.CurrentUsage),
+        local_gpu_budget_bytes = ?local.map(|m| m.Budget),
+        shared_gpu_usage_bytes = ?shared.map(|m| m.CurrentUsage),
         live_lists = LIVE_LISTS.load(Ordering::Relaxed),
         live_preludes = LIVE_PRELUDES.load(Ordering::Relaxed),
         "periodic GPU memory accounting (texture Arc ownership is a lower bound)");
@@ -2884,6 +2891,17 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    #[cfg(feature = "diagnostics")]
+    fn video_memory_segments(&self) -> [Option<DXGI_QUERY_VIDEO_MEMORY_INFO>; 2] {
+        use windows::Win32::Graphics::Dxgi::DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL;
+        [DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL].map(|segment| {
+            let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            // SAFETY: the adapter is the one backing this device, and the output is live.
+            unsafe { self.card_adapter.as_ref()?.QueryVideoMemoryInfo(0, segment, &mut info) }.ok()?;
+            Some(info)
+        })
+    }
+
     /// Admission is advisory: WDDM may reduce its budget later. Serialize
     /// our shadow allocations and retain headroom for original textures,
     /// pipelines and other allocations. Failure leaves the shared mirror.

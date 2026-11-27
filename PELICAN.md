@@ -1,13 +1,13 @@
-# Pelican
+# Cool Fox change history
 
-Pelican is a fork of [VIctory](https://github.com/Marvisak/VIctory). This file
+Cool Fox began as Pelican, a fork of [VIctory](https://github.com/Marvisak/VIctory). This file
 lists where the two differ. Everything not listed here is VIctory's, unchanged.
 
 ## Differences from VIctory
 
 | Area | Pelican | VIctory |
 |------|---------|---------|
-| Executable | `pelican.exe` | `victory.exe` |
+| Executable | `cool-fox.exe` | `victory.exe` |
 | Default data and cache folder | `%LOCALAPPDATA%\pelican` | `%LOCALAPPDATA%\victory` |
 | Input | Keyboard reports the character each held key types (layout, Shift, Caps Lock, AltGr, dead keys) | Character fields left empty |
 | Shader translation | Recognizes dimension-only bindless 2D image descriptors from original width/height/mip extraction and reads dimensions from the source view's own dynamic index; validated against two external shader fixtures | Unsupported descriptor-data reads can drop these pixel programs |

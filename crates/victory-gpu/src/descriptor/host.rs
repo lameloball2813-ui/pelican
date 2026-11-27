@@ -89,6 +89,38 @@ struct ReadRecords {
     /// buffer descriptors. Registry changes can make these tags live.
     dependencies: Option<std::collections::HashSet<u32>>,
     page_plans: Vec<Option<PagePlan>>,
+    chunks: Vec<Option<PlanChunk>>,
+}
+
+// A bounded cache of consecutive, already validated immutable page plans.
+// Retain the Arc identities themselves: a freed allocation's address must
+// never accidentally match a different plan. No descriptor validation is
+// bypassed by this cache.
+const PLAN_CHUNK_PAGES: usize = 8;
+struct PlanChunk {
+    pages: Vec<Arc<ReadPlan>>,
+    combined: Arc<ReadPlan>,
+}
+
+fn combine_chunks(cache: &mut Vec<Option<PlanChunk>>, pages: Vec<Arc<ReadPlan>>) -> (Arc<ReadPlan>, usize) {
+    cache.resize_with(pages.len().div_ceil(PLAN_CHUNK_PAGES), || None);
+    let mut reused = 0;
+    let mut groups = Vec::with_capacity(cache.len());
+    for (entry, group) in cache.iter_mut().zip(pages.chunks(PLAN_CHUNK_PAGES)) {
+        if let Some(saved) = entry.as_ref() {
+            if saved.pages.len() == group.len() && saved.pages.iter().zip(group).all(|(a,b)| Arc::ptr_eq(a,b)) {
+                groups.push(saved.combined.clone());
+                reused += 1;
+                continue;
+            }
+        }
+        let combined = ReadPlan::combine_pages(group.to_vec());
+        groups.push(combined.clone());
+        *entry = Some(PlanChunk { pages: group.to_vec(), combined });
+    }
+    // combine_pages is associative over consecutive runs: its union keeps
+    // first-seen shadow order and never crosses an original write boundary.
+    (ReadPlan::combine_pages(groups), reused)
 }
 
 struct PagePlan {
@@ -174,6 +206,7 @@ impl ReadRecords {
         self.mixed.clear();
         self.dependencies = None;
         self.page_plans.clear();
+        self.chunks.clear();
     }
 
     /// Return the number of raw descriptor records actually examined.
@@ -217,6 +250,7 @@ impl ReadRecords {
                 self.mixed.clear();
                 self.dependencies = None;
                 self.page_plans[i] = None;
+                if let Some(chunk) = self.chunks.get_mut(i / PLAN_CHUNK_PAGES) { *chunk = None; }
             }
             checked += to - from;
         }
@@ -1204,15 +1238,17 @@ impl HostHeap {
                 drop(made);
                 drop(revision);
                 let page_count = work.len();
-                let plan = ReadPlan::combine_pages(work.into_iter().map(|w| match w {
+                let combine_started = std::time::Instant::now();
+                let (plan, reused_chunks) = combine_chunks(&mut cache.chunks, work.into_iter().map(|w| match w {
                     Work::Ready(plan) => plan,
                     Work::Slow(..) => unreachable!(),
                 }).collect());
+                let combine_us = combine_started.elapsed().as_micros() as u64;
                 cache.publish(demand, view_revision, heap_revision, plan.clone());
                 static REBUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let builds = REBUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if builds.is_power_of_two() {
-                    tracing::info!(builds, reused_pages, page_count, checked, prepared=plan.prepared,
+                    tracing::info!(builds, reused_pages, page_count, reused_chunks, combine_us, checked, prepared=plan.prepared,
                         "buffer demand page plans combined");
                 }
                 return Some((plan, checked));
@@ -2868,6 +2904,95 @@ mod tests {
                 elapsed[3],elapsed[0],elapsed[6]);
         }
         for i in 0..32u64 { crate::shadow::unregister(owner + i as usize, base + i * 0x10000); }
+    }
+
+    fn chunk_fingerprint(p: &ReadPlan) -> Vec<(bool, usize, u64, u64)> {
+        let mut out = Vec::new();
+        let append = |out: &mut Vec<_>, ranges: &[(Arc<crate::shadow::Shadow>, Vec<(u64,u64)>)]| {
+            for (shadow, intervals) in ranges {
+                for &(a,b) in intervals { out.push((false, Arc::as_ptr(shadow) as usize, a,b)); }
+            }
+        };
+        append(&mut out, &p.ranges);
+        for step in &p.ordered {
+            match step {
+                PlanStep::Reads(ranges) => append(&mut out, ranges),
+                PlanStep::Write(b) => out.push((true, Arc::as_ptr(&b.shadow) as usize, b.address, b.address+b.len)),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn page_chunk_cache_preserves_order_and_exact_ranges() {
+        chunk_cache_exercise(19, 24, false);
+    }
+
+    #[test]
+    #[ignore = "combine-only descriptor plan benchmark"]
+    fn page_chunk_cache_combine_microbenchmark() {
+        chunk_cache_exercise(457, 512, true);
+    }
+
+    fn chunk_cache_exercise(npages: usize, nslots: usize, bench: bool) {
+        let base = 0x7d09_0000_0000u64;
+        let owner = usize::MAX - 500;
+        let heap = HostHeap::new(false, 2).expect("hardware heap");
+        let mut bindings = Vec::new();
+        for i in 0..2u64 {
+            let address = base+i*0x10000;
+            crate::shadow::register(owner+i as usize,address,0x10000);
+            let mut resource = [0u32;14];
+            resource[0]=1; resource[4]=0x10000;
+            let mut srv=[0u32;16];
+            srv[1]=1; srv[2]=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv[6]=8; srv[7]=16; srv[10]=address as u32; srv[11]=(address>>32) as u32;
+            let mut record=[0u32;8];
+            let at=record.as_mut_ptr() as u64;
+            super::super::record(at, View::Placed(false,resource,srv));
+            bindings.push(heap.mirror_buffer(i as u32,at,1).expect("binding").1);
+        }
+        let page = |p: usize, mutation: usize| {
+            let mut slots = Vec::new();
+            for i in 0..nslots {
+                let mut b=bindings[(i+p+mutation)%2].clone();
+                b.address += ((i*7+p*3+mutation)%256*32) as u64;
+                b.len=16;
+                // Writes on both sides of chunk boundaries, including
+                // consecutive writes and zero-length bindings.
+                let write = (p%8==7 && i+2>=nslots) || (p%8==0 && i==0) || (mutation!=0 && i==3);
+                if i==5 { b.len=0; }
+                slots.push((i as u32,write,b));
+            }
+            ReadPlan::from_slots(slots)
+        };
+        let mut pages: Vec<_>=(0..npages).map(|p|page(p,0)).collect();
+        let mut cache=Vec::new();
+        let mut flat_times=Vec::new();
+        let mut cached_times=Vec::new();
+        for iteration in 0..12 {
+            if iteration>0 {
+                let p=(iteration*13)%npages;
+                pages[p]=page(p,iteration);
+            }
+            let start=std::time::Instant::now();
+            let flat=ReadPlan::combine_pages(pages.clone());
+            let flat_ms=start.elapsed().as_secs_f64()*1000.0;
+            let start=std::time::Instant::now();
+            let (cached,reused)=combine_chunks(&mut cache,pages.clone());
+            let cached_ms=start.elapsed().as_secs_f64()*1000.0;
+            assert_eq!(cached.prepared,flat.prepared);
+            assert_eq!(chunk_fingerprint(&cached),chunk_fingerprint(&flat));
+            assert_eq!(reused,if iteration==0 {0} else {npages.div_ceil(PLAN_CHUNK_PAGES)-1});
+            if iteration>2 { flat_times.push(flat_ms); cached_times.push(cached_ms); }
+        }
+        let (empty,reused)=combine_chunks(&mut cache,Vec::new());
+        assert_eq!(empty.prepared,0); assert_eq!(reused,0); assert!(cache.is_empty());
+        if bench {
+            flat_times.sort_by(f64::total_cmp); cached_times.sort_by(f64::total_cmp);
+            eprintln!("combine only pages={npages} slots/page={nslots} flat median={:.3}ms chunk median={:.3}ms",flat_times[flat_times.len()/2],cached_times[cached_times.len()/2]);
+        }
+        for i in 0..2u64 { crate::shadow::unregister(owner+i as usize,base+i*0x10000); }
     }
 
     #[test]

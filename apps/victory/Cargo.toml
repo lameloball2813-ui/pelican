@@ -7,10 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Pelican keeps VIctory's package and crate names so upstream changes merge
+# Cool Fox keeps VIctory's package and crate names so upstream changes merge
 # cleanly; only the executable is renamed.
 [[bin]]
-name = "pelican"
+name = "cool-fox"
 path = "src/main.rs"
 
 [dependencies]
