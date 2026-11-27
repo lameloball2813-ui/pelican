@@ -41,6 +41,10 @@ That build also exercised late bindless texture rechecks. Those measurements
 are for the separate experiment. The 25 FPS gameplay target and character
 shading issues remain open.
 
+A cold run of the public build on the RTX 5060 Ti reached world draws with a
+black screen during the test. The log reported roughly 1 FPS, unresolved host
+pipelines, and compute shaders that still require 64-lane waves.
+
 ### Earlier development status (2026-11-24)
 
 **Experimental; not yet playable at normal speed.** The game boots, enters the
