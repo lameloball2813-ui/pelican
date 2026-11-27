@@ -325,6 +325,7 @@ pub(crate) fn logical_lane_audit(parts: &Parts) -> Vec<(usize, u32, bool)> {
     sites
 }
 
+#[cfg(test)]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_with_static_cbvs(parts, false)
 }
@@ -1583,10 +1584,6 @@ pub(crate) fn filter_lds_audit(parts: &Parts) -> Option<(usize, usize, usize)> {
     filter_lds_phase(parts).map(|((b,i), writes, reads)| (parts.p.blocks[b].insts[i].machine.offset, writes, reads))
 }
 
-#[cfg(test)]
-pub(crate) fn matrix_lds_audit(parts:&Parts) -> Option<(Site,Site,usize,usize)> {
-    matrix_lds_phase(parts)
-}
 
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
 /// packing 16-bit rows `a` and `b` two per dword comes from: a row and
@@ -5240,8 +5237,8 @@ impl<'a> Lower<'a> {
     }
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
-        if let Some(plan) = self.lds_allocation {
-            if plan.init == (b, i) {
+        if let Some(plan) = self.lds_allocation
+            && plan.init == (b, i) {
                 let tid = self.mesh_thread();
                 let zero = self.s.m.i32(0);
                 let leader = self.s.m.cmp(self.cur, pred::EQ, tid, zero);
@@ -5251,7 +5248,6 @@ impl<'a> Lower<'a> {
                 self.end_guarded(at, &[]);
                 self.allocation_sync(9);
             }
-        }
         if let Some((site, mode)) = self.implicit_lds_barrier && site == (b, i) {
             let mode = self.s.m.i32(mode); // group sync + TGSM, UAV fence for image filter
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[mode]);
@@ -9883,9 +9879,9 @@ impl<'a> Lower<'a> {
         if let Some(x) = extra {
             off = self.s.m.bin(c, Bin::Add, off, x);
         }
-        if !typed && used.is_none() {
-            if let Some(element) = index {
-                if let Some(stride) = self.slot_stride(src)? {
+        if !typed && used.is_none()
+            && let Some(element) = index
+                && let Some(stride) = self.slot_stride(src)? {
                     let at = self.s.m.bin(c, Bin::Mul, element, stride);
                     let byte = self.s.m.bin(c, Bin::Add, at, off);
                     // An unwritten/wrong-type heap slot has no meaningful
@@ -9897,8 +9893,6 @@ impl<'a> Lower<'a> {
                     off = self.s.m.select(c, missing, invalid, byte);
                     index = None;
                 }
-            }
-        }
         // The original used-resource record supplies a known byte stride.
         // Access through a raw descriptor at the computed byte offset so
         // indexed and byte-addressed views work the same way on NVIDIA.
@@ -10809,12 +10803,11 @@ impl<'a> Lower<'a> {
                 };
                 incoming.push((x, qb));
             }
-            if self.lds_allocation.is_some_and(|p| p.gate == b) {
-                if let Some(a) = self.abort {
+            if self.lds_allocation.is_some_and(|p| p.gate == b)
+                && let Some(a) = self.abort {
                     let dummy = if bit { self.s.m.bool(false) } else { self.s.m.i32(0) };
                     incoming.push((dummy, a));
                 }
-            }
             self.s.m.set_phi(v, incoming);
         }
         for (phi, incoming) in std::mem::take(&mut self.counters).into_values() {
@@ -10834,9 +10827,8 @@ impl<'a> Lower<'a> {
                 let x = self.boolean(m, qb).map_err(|w| unsupported(offset, w))?;
                 incoming.push((x, qb));
             }
-            if self.lds_allocation.is_some_and(|p| p.gate == b) {
-                if let Some(a) = self.abort { incoming.push((self.s.m.bool(false), a)); }
-            }
+            if self.lds_allocation.is_some_and(|p| p.gate == b)
+                && let Some(a) = self.abort { incoming.push((self.s.m.bool(false), a)); }
             self.s.m.set_phi(v, incoming);
         }
         Ok(())

@@ -42,9 +42,11 @@ pub(crate) fn allocate(
     // Query the driver rather than assuming that a texture supports 4 KiB
     // placement. The standard alignment remains a safe fallback.
     packed.Alignment = 4096;
+    // SAFETY: The device is live and the slice contains one initialized resource description.
     let mut info = unsafe { device.GetResourceAllocationInfo(0, &[packed]) };
     if info.SizeInBytes == u64::MAX || info.Alignment != 4096 {
         packed.Alignment = 0;
+        // SAFETY: The device is live and the description has been reset to default alignment.
         info = unsafe { device.GetResourceAllocationInfo(0, &[packed]) };
     }
     if info.SizeInBytes > MAX_TEXTURE || info.Alignment > 65536 {
@@ -67,6 +69,7 @@ pub(crate) fn allocate(
             Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
         };
         let mut heap = None;
+        // SAFETY: The initialized heap description and output slot are valid for the live device.
         unsafe { device.CreateHeap(&desc, &mut heap) }.ok()?;
         *pool = Some(Chunk { device: device_key, heap: heap?, end: 0 });
     }
@@ -75,12 +78,14 @@ pub(crate) fn allocate(
     // Consume the range even if creation or attaching the owner fails.
     chunk.end = next;
     let mut resource: Option<ID3D12Resource> = None;
+    // SAFETY: The chunk owns the heap; offset is aligned and the allocation fits the reserved range.
     unsafe {
         device.CreatePlacedResource(&chunk.heap, offset, &packed, state, None, &mut resource)
     }.ok()?;
     let resource = resource?;
     // The heap must outlive every COM reference to this resource. Private
     // interface data holds a reference until the resource itself is destroyed.
+    // SAFETY: The resource and heap are live COM objects and OWNER is a valid private-data key.
     unsafe { resource.SetPrivateDataInterface(&OWNER, &chunk.heap) }.ok()?;
     Some(resource)
 }

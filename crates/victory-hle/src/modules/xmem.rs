@@ -509,6 +509,7 @@ struct ReadAlias {
 impl Drop for ReadAlias {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        // SAFETY: `base` is the successful MapViewOfFile result owned exclusively by this ReadAlias; Drop runs once.
         unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.base as *mut c_void }); }
     }
 }
@@ -517,6 +518,7 @@ impl ReadAlias {
     fn new(section: &Section, writable: bool) -> Option<Self> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_READ, FILE_MAP_WRITE, MapViewOfFile, PAGE_READONLY, PAGE_READWRITE};
         let access = if writable { FILE_MAP_WRITE } else { FILE_MAP_READ };
+        // SAFETY: `section` keeps its valid mapping handle alive, and `section.bytes` is the section extent; no Rust memory is dereferenced by this call.
         let view = unsafe { MapViewOfFile(section.handle, access, 0, 0, section.bytes) };
         if view.Value.is_null() { return None; }
         Some(Self { base: view.Value as usize, protection: if writable { PAGE_READWRITE } else { PAGE_READONLY }, verified: Mutex::new(vec![false; section.bytes / PAGE]) })
@@ -532,7 +534,9 @@ impl ReadAlias {
         while page < last {
             if verified[page] { page += 1; continue; }
             let at = self.base + page * PAGE;
+            // SAFETY: MEMORY_BASIC_INFORMATION consists of pointers and integer fields, for which all-zero is valid.
             let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: VirtualQuery queries an address without dereferencing it; `info` is writable for the supplied structure size.
             if unsafe { VirtualQuery(at as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0
                 || info.State != MEM_COMMIT || info.Protect != self.protection
                 || info.AllocationBase as usize != self.base { return None; }
@@ -647,12 +651,11 @@ pub unsafe fn read_physical_alias(dst: *mut u8, src: *const u8, len: usize) -> b
             let Some(offset) = slice.index.checked_mul(PAGE).and_then(|v| v.checked_add(at - base)) else { return false; };
             let Some(alias) = slice.section.read_alias.get_or_init(|| ReadAlias::new(&slice.section, false)).as_ref() else { return false; };
             let Some(source) = alias.checked(offset, n) else { return false; };
-            if let Some((previous, bytes)) = runs.last_mut() {
-                if previous.checked_add(*bytes) == Some(source) {
-                    *bytes += n;
-                    at += n;
-                    continue;
-                }
+            if let Some((previous, bytes)) = runs.last_mut()
+                && previous.checked_add(*bytes) == Some(source) {
+                *bytes += n;
+                at += n;
+                continue;
             }
             runs.push((source, n));
             at += n;
@@ -709,7 +712,9 @@ pub unsafe fn write_physical_alias_runs(dst: *mut u8, src: &[u8], runs: &[(usize
                 static SAMPLES: AtomicUsize = AtomicUsize::new(0);
                 let sample = SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
                 if sample.is_power_of_two() {
+                    // SAFETY: MEMORY_BASIC_INFORMATION has only pointer and integer fields, all valid when zeroed.
                     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                    // SAFETY: VirtualQuery accepts an address to inspect (even if unmapped) and writes into the correctly sized local structure.
                     let queried = unsafe { VirtualQuery(start as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } != 0;
                     tracing::info!(sample, queried, start = format_args!("{start:#x}"), end = format_args!("{end:#x}"),
                         preceding_end = format_args!("{:#x}", base.saturating_add(*size)),
@@ -720,7 +725,9 @@ pub unsafe fn write_physical_alias_runs(dst: *mut u8, src: &[u8], runs: &[(usize
             }
             return Err(Refusal::ViewExtent);
         }
+        // SAFETY: All-zero is valid for the pointer and integer fields of MEMORY_BASIC_INFORMATION.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: The queried address is passed by value, not dereferenced; `info` is a writable structure of the specified size.
         if unsafe { VirtualQuery(start as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 { return Err(Refusal::QueryFailed); }
         if info.State != MEM_COMMIT { return Err(Refusal::NotCommitted); }
         if info.Type != MEM_MAPPED { return Err(Refusal::NotMapped); }
@@ -1092,12 +1099,11 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         if at(&physical, to + k).is_some_and(|old| {
             Arc::ptr_eq(&old.section, &slice.section) && old.index == slice.index
         }) { continue; }
-        if let Some((start, size, first)) = changes.last_mut() {
-            if *start + *size == to + k && Arc::ptr_eq(&first.section, &slice.section)
+        if let Some((start, size, first)) = changes.last_mut()
+            && *start + *size == to + k && Arc::ptr_eq(&first.section, &slice.section)
                 && first.index + *size / PAGE == slice.index {
-                *size += PAGE;
-                continue;
-            }
+            *size += PAGE;
+            continue;
         }
         changes.push((to + k, PAGE, slice));
     }
@@ -1677,7 +1683,10 @@ mod tests {
         let (a, b) = (reserve(), reserve());
         assert!(a != 0 && b != 0);
         assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 4, pages.as_ptr()) as usize, a);
-        for i in 0..4 { unsafe { ((a + i * PAGE) as *mut u8).write((i + 1) as u8); } }
+        for i in 0..4 {
+            // SAFETY: The successful four-page mapping above covers every address in this loop; the test owns the mapping.
+            unsafe { ((a + i * PAGE) as *mut u8).write((i + 1) as u8); }
+        }
         assert!(map_alias(b as u64, a as u64, (4 * PAGE) as u64));
         let mappings = |base: usize| {
             let p = physical();
@@ -1690,11 +1699,15 @@ mod tests {
         assert_eq!(mappings(b), before);
         assert!(map_alias((b + PAGE) as u64, b as u64, (3 * PAGE) as u64));
         for (i, expected) in [1u8, 1, 2, 3].into_iter().enumerate() {
+            // SAFETY: The successful alias operations above leave all four pages of `b` mapped and readable.
             assert_eq!(unsafe { ((b + i * PAGE) as *const u8).read() }, expected);
         }
         // Both aliases must still see writes to their common section page.
+        // SAFETY: The original mapping at `a` is still writable and owned by this test.
         unsafe { (a as *mut u8).write(0x9a); }
+        // SAFETY: The first page of `b` remains mapped to the first section page.
         assert_eq!(unsafe { (b as *const u8).read() }, 0x9a);
+        // SAFETY: The overlapping alias operation also mapped the second page of `b` to that same section page.
         assert_eq!(unsafe { ((b + PAGE) as *const u8).read() }, 0x9a);
         assert!(map_alias(b as u64, 0, (4 * PAGE) as u64));
         assert!(map_alias(a as u64, 0, (4 * PAGE) as u64));
@@ -1708,8 +1721,10 @@ mod tests {
             MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
         assert_ne!(a, 0);
         assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 1, pages.as_ptr()) as usize, a);
+        // SAFETY: The successful one-page mapping above provides PAGE writable bytes.
         unsafe { (a as *mut u8).write_bytes(0x31, PAGE); }
         let mut data = vec![0u8; PAGE + 17];
+        // SAFETY: `data` is an independent writable host slice; the reader validates the title address before accessing it.
         let read = |data: &mut [u8], at: usize| unsafe {
             read_physical_alias(data.as_mut_ptr(), at as *const u8, data.len())
         };
@@ -1719,6 +1734,7 @@ mod tests {
         // already-existing stable read alias after the title maps it.
         assert!(!read(&mut data, a));
         assert_eq!(XMemMapPhysicalPages((a + PAGE) as *mut c_void, 1, pages[1..].as_ptr()) as usize, a + PAGE);
+        // SAFETY: The second page has just been mapped successfully, providing PAGE writable bytes.
         unsafe { ((a + PAGE) as *mut u8).write_bytes(0x42, PAGE); }
         assert!(read(&mut data, a + 9));
         assert!(data[..PAGE - 9].iter().all(|&b| b == 0x31));
@@ -1726,6 +1742,7 @@ mod tests {
         // Reassign the virtual page, not just its contents. The reader
         // must resolve the current section offset on every refresh.
         assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 1, pages[2..].as_ptr()) as usize, a);
+        // SAFETY: The first page was successfully remapped and remains writable for PAGE bytes.
         unsafe { (a as *mut u8).write_bytes(0x53, PAGE); }
         assert!(read(&mut data, a));
         assert!(data[..PAGE].iter().all(|&b| b == 0x53));
@@ -1744,6 +1761,7 @@ mod tests {
         assert_ne!(b, 0);
         assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 1, pages.as_ptr()) as usize, a);
         assert!(map_alias(b as u64, a as u64, PAGE as u64));
+        // SAFETY: The successful first-page mapping at `a` remains writable for PAGE bytes.
         unsafe { (a as *mut u8).write_bytes(0x31, PAGE); }
         let src = vec![0x99; PAGE];
         let runs: Vec<_> = (0..128).map(|i| {
@@ -1752,10 +1770,12 @@ mod tests {
         }).chain(std::iter::once((PAGE - 1, PAGE))).collect();
         let write = |at: usize, runs: &[(usize, usize)]| {
             let _guard = victory_gpu::begin_kernel_write(at, PAGE, false);
+            // SAFETY: The source is an independent host vector, `at` identifies the test's intended title span, and the write guard is held; the helper validates runs and mapping before copying.
             unsafe { write_physical_alias_runs(at as *mut u8, &src, runs) }
         };
         assert!(write(a, &runs).is_ok());
         let mut actual = vec![0; PAGE];
+        // SAFETY: `actual` is an independent writable PAGE-byte vector; the helper validates the source mapping.
         assert!(unsafe { read_physical_alias(actual.as_mut_ptr(), b as *const u8, PAGE) });
         let mut expected = vec![0x31; PAGE];
         for &(lo, hi) in &runs { expected[lo..hi].fill(0x99); }
@@ -1763,6 +1783,7 @@ mod tests {
         assert_eq!(write(a + PAGE - 2, &[(0, 1), (3, 4)]),
             Err(victory_gpu::PhysicalWriteRefusal::CrossPage));
         assert_eq!(XMemMapPhysicalPages(a as *mut c_void, 1, pages[1..].as_ptr()) as usize, a);
+        // SAFETY: The successful remapping at `a` provides PAGE writable bytes.
         unsafe { (a as *mut u8).write_bytes(0x42, PAGE); }
         assert!(write(a, &runs).is_ok());
         assert_eq!(page_bytes(pages[0]), expected);
@@ -1782,15 +1803,20 @@ mod tests {
         let source = vec![0x99; PAGE];
         // These are independent pre-copy failures. In particular a bogus
         // destination must never be dereferenced just to diagnose its view.
-        let bogus = 1usize as *mut u8;
+        let bogus = std::ptr::dangling_mut::<u8>();
+        // SAFETY: The empty run list is rejected before the destination or write guard is used; `source` is independent host memory.
         assert_eq!(unsafe { write_physical_alias_runs(bogus, &source, &[]) },
             Err(R::InvalidRuns));
+        // SAFETY: The zero-length run is rejected before any destination access.
         assert_eq!(unsafe { write_physical_alias_runs(bogus, &source, &[(0, 0)]) },
             Err(R::InvalidRuns));
+        // SAFETY: The unsorted overlapping runs are rejected before any destination access.
         assert_eq!(unsafe { write_physical_alias_runs(bogus, &source, &[(1, 2), (0, 1)]) },
             Err(R::InvalidRuns));
+        // SAFETY: The dangling address has no registered physical view; the helper returns before any destination access.
         assert_eq!(unsafe { write_physical_alias_runs(bogus, &source, &[(0, 1)]) },
             Err(R::NoView));
+        // SAFETY: The range straddles a page boundary and is rejected before any destination access.
         assert_eq!(unsafe { write_physical_alias_runs((PAGE-1) as *mut u8, &source, &[(0, 2)]) },
             Err(R::CrossPage));
     }
@@ -1802,6 +1828,7 @@ mod tests {
             0, PAGE_READWRITE) as usize;
         assert_ne!(dst, 0);
         assert_eq!(XMemMapPhysicalPages(dst as *mut c_void, 3, pages.as_ptr()) as usize, dst);
+        // SAFETY: The successful three-page mapping provides 3 * PAGE writable bytes owned by the test.
         unsafe { (dst as *mut u8).write_bytes(0x42, 3 * PAGE); }
         let src = vec![0xD7; 3 * PAGE];
         let runs = [(PAGE - 7, PAGE + 5), (PAGE + 43, PAGE + 49),
@@ -1823,20 +1850,25 @@ mod tests {
         for group in &groups {
             let _guard = victory_gpu::begin_kernel_write(dst + group[0].0,
                 group.last().unwrap().1 - group[0].0, false);
+            // SAFETY: The independent host source covers the runs, the destination is the test mapping, and the guard covers this group.
             assert!(unsafe { write_physical_alias_runs(dst as *mut u8, &src, group) }.is_ok());
         }
         let mut expected = vec![0x42; 3 * PAGE];
         for (a,b) in runs { expected[a..b].fill(0xD7); }
         let mut actual = vec![0; 3 * PAGE];
+        // SAFETY: `actual` is an independent writable vector of 3 * PAGE bytes; the helper validates the source mapping.
         assert!(unsafe { read_physical_alias(actual.as_mut_ptr(), dst as *const u8, 3 * PAGE) });
         assert_eq!(actual, expected);
         assert_eq!(XMemMapPhysicalPages((dst + PAGE) as *mut c_void, 1, pages[0..].as_ptr()) as usize, dst + PAGE);
+        // SAFETY: The successful remapping of the middle page supplies PAGE writable bytes.
         unsafe { ((dst + PAGE) as *mut u8).write_bytes(0x88, PAGE); }
         let mid = [(PAGE + 7, PAGE + 11)];
         let _guard = victory_gpu::begin_kernel_write(dst + mid[0].0, 4, false);
+        // SAFETY: The independent source covers the middle-page run, the destination is the test mapping, and the write guard is held.
         assert!(unsafe { write_physical_alias_runs(dst as *mut u8, &src, &mid) }.is_ok());
         assert_eq!(&page_bytes(pages[0])[7..11], &[0xD7;4]);
         assert_eq!(XMemMapPhysicalPages(dst as *mut c_void, 3, std::ptr::null()) as usize, dst);
+        // SAFETY: The destination is the test's now-unmapped span; the guard is still held and the helper rejects the missing view before accessing it.
         assert!(unsafe { write_physical_alias_runs(dst as *mut u8, &src, &mid) }.is_err());
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }

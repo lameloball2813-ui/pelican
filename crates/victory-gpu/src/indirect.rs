@@ -286,6 +286,7 @@ mod tests {
         let (result, result_ptr) = host.shared_buffer(4096).unwrap();
         super::ready(&list, &output, Some(&count));
         list.ensure_buffer_state(&result, 0x400);
+        // SAFETY: The open list has prepared the source and destination states; both buffers cover the 16-byte copy.
         unsafe { list.list.CopyBufferRegion(&result, 0, &output, 0, 16); }
         list.close();
         host.execute(&[&list]);
@@ -293,6 +294,7 @@ mod tests {
         let out = unsafe { std::slice::from_raw_parts(args_ptr.cast::<[u32; 4]>(), 80) };
         assert_eq!(out[0], [100, 2, 0, 0]);
         assert_eq!(out[1], [1 << 24, 16, 0, 0]);
+        // SAFETY: The completed GPU copy initialized the first aligned 16 bytes of the mapped result.
         assert_eq!(unsafe { result_ptr.cast::<[u32; 4]>().read() }, [100, 2, 0, 0]);
 
         let list2 = host.new_list().unwrap();
@@ -306,12 +308,14 @@ mod tests {
         let output = super::bound(&list2, &args, args_gpu, None, (0, 16, 80)).unwrap();
         super::ready(&list2, &output, None);
         list2.ensure_buffer_state(&result, 0x400);
+        // SAFETY: The prepared source and destination cover all 80 records and the list is open.
         unsafe { list2.list.CopyBufferRegion(&result, 0, &output, 0, 80 * 16); }
         list2.close();
         host.execute(&[&list2]);
         // safety: `host.execute` waits for completion.
         let out = unsafe { std::slice::from_raw_parts(result_ptr.cast::<[u32; 4]>(), 80) };
         assert_eq!(out.iter().filter(|r| r[0] > 0).count(), 2);
+        // SAFETY: The mapped input allocation contains 80 aligned records initialized by the test; the GPU execution is complete.
         assert!(unsafe { std::slice::from_raw_parts(args_ptr.cast::<[u32; 4]>(), 80) }.iter().all(|r| *r == [1 << 24, 16, 0, 0]));
     }
 
@@ -324,6 +328,7 @@ mod tests {
         let (result, dst) = host.shared_buffer(4096).unwrap();
         let first = [5u32, 3, 17, (-12i32) as u32, 29, 0xfeed, 0xbeef, 0x1234];
         let second = [7u32, 2, 19, (-4i32) as u32, 31, 0xaa, 0xbb, 0xcc];
+        // SAFETY: The mapped source allocation covers both aligned records and the count at byte 256.
         let gpu = unsafe {
             ptr.cast::<[u32; 8]>().write(first);
             ptr.add(32).cast::<[u32; 8]>().write(second);
@@ -333,16 +338,22 @@ mod tests {
         let a = super::bound(&list, &source, gpu, Some((&source, gpu + 256)), (1, 32, 2)).unwrap();
         super::ready(&list, &a, Some(&source));
         list.ensure_buffer_state(&result, 0x400);
+        // SAFETY: The prepared scratch and result cover the 20-byte copy and the list is open.
         unsafe { list.list.CopyBufferRegion(&result, 0, &a, 0, 20); }
         let b = super::bound(&list, &source, gpu + 32, None, (1, 32, 1)).unwrap();
         assert_eq!(a.as_raw(), b.as_raw());
         super::ready(&list, &b, None);
+        // SAFETY: The second prepared scratch record and the result's second 20-byte range are live and in copy states.
         unsafe { list.list.CopyBufferRegion(&result, 20, &b, 0, 20); }
         list.close();
         host.execute(&[&list]);
+        // SAFETY: The completed copies initialized 40 bytes of the aligned mapped result.
         assert_eq!(unsafe { std::slice::from_raw_parts(dst.cast::<u32>(), 10) }, [&first[..5], &second[..5]].concat());
+        // SAFETY: The first aligned record is within the live mapped source.
         assert_eq!(unsafe { ptr.cast::<[u32; 8]>().read() }, first);
+        // SAFETY: The second aligned record at byte 32 is within the live mapped source.
         assert_eq!(unsafe { ptr.add(32).cast::<[u32; 8]>().read() }, second);
+        // SAFETY: The aligned count word at byte 256 is within the live mapped source.
         assert_eq!(unsafe { ptr.add(256).cast::<u32>().read() }, 1);
     }
 }

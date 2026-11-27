@@ -107,12 +107,11 @@ fn combine_chunks(cache: &mut Vec<Option<PlanChunk>>, pages: Vec<Arc<ReadPlan>>)
     let mut reused = 0;
     let mut groups = Vec::with_capacity(cache.len());
     for (entry, group) in cache.iter_mut().zip(pages.chunks(PLAN_CHUNK_PAGES)) {
-        if let Some(saved) = entry.as_ref() {
-            if saved.pages.len() == group.len() && saved.pages.iter().zip(group).all(|(a,b)| Arc::ptr_eq(a,b)) {
+        if let Some(saved) = entry.as_ref()
+            && saved.pages.len() == group.len() && saved.pages.iter().zip(group).all(|(a,b)| Arc::ptr_eq(a,b)) {
                 groups.push(saved.combined.clone());
                 reused += 1;
                 continue;
-            }
         }
         let combined = ReadPlan::combine_pages(group.to_vec());
         groups.push(combined.clone());
@@ -262,21 +261,22 @@ impl ReadRecords {
 
 /// Immutable, exact SRV demand in the original first-seen shadow order.
 /// Each consuming list replays state transitions and deferred refreshes.
+pub(crate) type ShadowRanges = (Arc<crate::shadow::Shadow>, Vec<(u64, u64)>);
 pub(crate) struct ReadPlan {
-    pub(crate) ranges: Vec<(Arc<crate::shadow::Shadow>, Vec<(u64, u64)>)>,
+    pub(crate) ranges: Vec<ShadowRanges>,
     pub(crate) prepared: u64,
     pub(crate) ordered: Vec<PlanStep>,
 }
 
 pub(crate) enum PlanStep {
-    Reads(Vec<(Arc<crate::shadow::Shadow>, Vec<(u64, u64)>)>),
+    Reads(Vec<ShadowRanges>),
     Write(BufferBinding),
 }
 
 impl ReadPlan {
     fn new(bindings: Vec<BufferBinding>) -> Arc<Self> {
         let mut by_shadow = std::collections::HashMap::new();
-        let mut ranges: Vec<(Arc<crate::shadow::Shadow>, Vec<(u64, u64)>)> = Vec::new();
+        let mut ranges: Vec<ShadowRanges> = Vec::new();
         let mut prepared = 0;
         for BufferBinding { shadow, address, len } in bindings {
             if len == 0 { continue; }
@@ -340,8 +340,8 @@ impl ReadPlan {
         let mut ordered = Vec::new();
         let mut reads = Vec::new();
         let mut by_shadow = std::collections::HashMap::new();
-        let append = |ranges: &[(Arc<crate::shadow::Shadow>, Vec<(u64,u64)>)],
-                      reads: &mut Vec<(Arc<crate::shadow::Shadow>, Vec<(u64,u64)>)>,
+        let append = |ranges: &[ShadowRanges],
+                      reads: &mut Vec<ShadowRanges>,
                       by_shadow: &mut std::collections::HashMap<usize,usize>| {
             for (shadow, intervals) in ranges {
                 let next = reads.len();
@@ -350,7 +350,7 @@ impl ReadPlan {
                 reads[index].1.extend_from_slice(intervals);
             }
         };
-        let finish = |reads: &mut Vec<(Arc<crate::shadow::Shadow>, Vec<(u64,u64)>)>| {
+        let finish = |reads: &mut Vec<ShadowRanges>| {
             for (_, intervals) in reads {
                 intervals.sort_unstable();
                 let mut n = 0;
@@ -407,8 +407,10 @@ impl BufferBinding {
 /// class, and the actual retained shadow selected for this materialization.
 /// A new registered or loose allocation at the same title address must
 /// never pick up the old host descriptor.
+type SharedTableEntry = (u32, [u32; 3], victory_shader::ResourceType, u8, Option<(usize, u64, u64)>);
 #[derive(PartialEq, Eq, Hash)]
-struct SharedTableKey(Vec<(u32, [u32; 3], victory_shader::ResourceType, u8, Option<(usize, u64, u64)>)>);
+struct SharedTableKey(Vec<SharedTableEntry>);
+pub(crate) type SharedRecord = (u32, [u32; 3], Option<(victory_shader::ResourceType, u8)>);
 
 enum PreparedShared {
     Srv(D3D12_SHADER_RESOURCE_VIEW_DESC, BufferBinding),
@@ -699,8 +701,8 @@ fn reserve_contiguous(taken: &mut [bool], next: usize, n: usize) -> Option<usize
     let next = next.min(taken.len());
     let find = |from, to| {
         let mut run = 0;
-        for at in from..to {
-            run = if taken[at] { 0 } else { run + 1 };
+        for (at, &used) in taken.iter().enumerate().take(to).skip(from) {
+            run = if used { 0 } else { run + 1 };
             if run == n { return Some(at + 1 - n); }
         }
         None
@@ -768,7 +770,7 @@ impl HostHeap {
     /// a second time by address. Unsupported views take the old path.
     pub(crate) fn share_static_table(
         &self,
-        records: &[(u32, [u32; 3], Option<(victory_shader::ResourceType, u8)>)],
+        records: &[SharedRecord],
     ) -> Option<Arc<SharedTable>> {
         use victory_shader::ResourceType;
         if self.sampler || records.is_empty() { return None; }
@@ -801,7 +803,7 @@ impl HostHeap {
         }
         // Weak entries cannot pin descriptor slots or shadow resources.
         // Bound the dead metadata even when the title streams unique tables.
-        if cache.len() >= 1024 && cache.len() % 256 == 0 {
+        if cache.len() >= 1024 && cache.len().is_multiple_of(256) {
             cache.retain(|_, v| v.strong_count() != 0);
         }
         let offsets: Vec<_> = records.iter().map(|r| r.0).collect();
@@ -1151,7 +1153,7 @@ impl HostHeap {
             // mapping changes. The legacy guard for an unknown MEM_MAPPED
             // view cannot establish that another alias did not write it.
             // Private/unregistered allocations retain a full raw scan.
-            let observed = if start % 32 == 0
+            let observed = if start.is_multiple_of(32)
                 && crate::watch::known_physical(start as usize, end as usize)
             {
                 crate::watch::writes(start as usize, end as usize, true)
@@ -1197,9 +1199,8 @@ impl HostHeap {
                 let mut records = raw.iter().copied().peekable();
                 // Include tracked slots whose raw tags disappeared. Never
                 // replace a retained backing with an address-only lookup.
-                loop {
-                    let Some(index) = [known.peek().copied(), bound.peek().map(|(i, _)| **i),
-                        records.peek().map(|(i, _)| *i)].into_iter().flatten().min() else { break };
+                while let Some(index) = [known.peek().copied(), bound.peek().map(|(i, _)| **i),
+                    records.peek().map(|(i, _)| *i)].into_iter().flatten().min() {
                     let tracked = known.next_if_eq(&index).is_some();
                     let binding = bound.next_if(|(slot, _)| **slot == index).map(|(_, b)| b);
                     let [tag, i, generation] = records.next_if(|(slot, _)| *slot == index)
@@ -1321,12 +1322,10 @@ impl HostHeap {
             return None;
         };
         if let Some(classes) = classes {
-            if view_stride(&view).is_none() {
-                // A class-filtered query is not a descriptor write. Do not
-                // erase the retained backing of the still materialized slot:
-                // a later named table or raw record copy can use it again.
-                return None;
-            }
+            // A class-filtered query is not a descriptor write. Do not
+            // erase the retained backing of the still materialized slot:
+            // a later named table or raw record copy can use it again.
+            view_stride(&view)?;
             let writes = matches!(view, View::Unordered(..) | View::Placed(true, ..));
             if classes & if writes { 2 } else { 1 } == 0 {
                 return None;
@@ -1465,7 +1464,9 @@ fn readable_descriptor_heap(start: u64, count: u32) -> bool {
     let Ok(mut at) = usize::try_from(start) else { return false };
     let Some(end) = at.checked_add(count as usize * 32) else { return false };
     while at < end {
+        // SAFETY: MEMORY_BASIC_INFORMATION is a plain Windows output structure valid when zero initialized.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: VirtualQuery only queries the address and writes into the supplied correctly sized structure.
         if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0
             || info.State != MEM_COMMIT
             || info.Protect & PAGE_GUARD != 0
@@ -1536,6 +1537,7 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 
 /// The title memory a buffer shader or unordered access view reads: its
 /// address and length.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
     let (base, words): (u64, &[u32; 10]) = match view {
         View::Shader(r, Some(desc)) => (
@@ -1567,6 +1569,7 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
+#[cfg(feature = "diagnostics")]
 fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     let desc = uav_desc(words);
     // SAFETY: a buffer view's union member.
@@ -1622,6 +1625,7 @@ fn prepare_buffer_srv(
     let offset = shadow.offset(address);
     // A raw DXIL access into a structured NVIDIA view reads zeros. Make
     // the view raw for the exact same title bytes when alignment permits.
+    // SAFETY: Callers supply buffer SRV descriptions, so the Buffer union member is initialized.
     let structured = unsafe { desc.Anonymous.Buffer };
     let window = (desc.Format == DXGI_FORMAT_UNKNOWN)
         .then(|| raw_window(offset, structured.FirstElement,
@@ -1779,7 +1783,7 @@ fn prepare_buffer_uav(
 /// of guessing a binding or using per-list constant scratch.
 fn prepare_shared_buffer(view: &View, kind: victory_shader::ResourceType) -> Option<PreparedShared> {
     use victory_shader::ResourceType;
-    if view_stride(view).is_none() { return None; }
+    view_stride(view)?;
     let (address, len, words): (u64, u64, &[u32; 10]) = match (view, kind) {
         (View::Shader(resource, Some(words)), ResourceType::Srv)
         | (View::Unordered(resource, 0, Some(words)), ResourceType::Uav) => {
@@ -2689,6 +2693,7 @@ mod tests {
         // plan even if the added range is already in its union.
         let (stable, _) = heap.read_buffer_batch(start).unwrap();
         slots[0] = slots[1];
+        std::hint::black_box(&slots);
         let (copied, _) = heap.read_buffer_batch(start).unwrap();
         assert_eq!(copied.prepared, 2);
         assert!(!Arc::ptr_eq(&stable, &copied));
@@ -2758,6 +2763,7 @@ mod tests {
         assert!(read.ordered.is_empty());
         // A raw class change must invalidate both the union and ordered plan.
         slots[1] = slots[0];
+        std::hint::black_box(&slots);
         let (changed, _) = heap.buffer_batch(start, 1, exact).unwrap();
         assert_eq!(changed.prepared, 4);
         assert!(changed.ordered.is_empty());
@@ -2908,7 +2914,7 @@ mod tests {
 
     fn chunk_fingerprint(p: &ReadPlan) -> Vec<(bool, usize, u64, u64)> {
         let mut out = Vec::new();
-        let append = |out: &mut Vec<_>, ranges: &[(Arc<crate::shadow::Shadow>, Vec<(u64,u64)>)]| {
+        let append = |out: &mut Vec<_>, ranges: &[ShadowRanges]| {
             for (shadow, intervals) in ranges {
                 for &(a,b) in intervals { out.push((false, Arc::as_ptr(shadow) as usize, a,b)); }
             }
@@ -2960,7 +2966,7 @@ mod tests {
                 b.len=16;
                 // Writes on both sides of chunk boundaries, including
                 // consecutive writes and zero-length bindings.
-                let write = (p%8==7 && i+2>=nslots) || (p%8==0 && i==0) || (mutation!=0 && i==3);
+                let write = (p%8==7 && i+2>=nslots) || (p.is_multiple_of(8) && i==0) || (mutation!=0 && i==3);
                 if i==5 { b.len=0; }
                 slots.push((i as u32,write,b));
             }
@@ -3000,6 +3006,7 @@ mod tests {
         use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RESERVE, MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE};
         const P: u32 = SLOTS_PER_PAGE;
         let heap = HostHeap::new(false, 3 * P).expect("hardware heap");
+        // SAFETY: A null requested address lets Windows allocate three committed writable pages; success is checked below.
         let start = unsafe { VirtualAlloc(std::ptr::null(), 3 * crate::watch::PAGE,
             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
         assert_ne!(start, 0);
@@ -3025,6 +3032,7 @@ mod tests {
         uav[10] = base as u32;
         uav[11] = (base >> 32) as u32;
         let at = |i: u32| start + u64::from(i) * 32;
+        // SAFETY: The test calls this closure with distinct record indices within the committed three-page allocation.
         let copy = |from: u32, to: u32| unsafe {
             std::ptr::copy_nonoverlapping(at(from) as *const u32, at(to) as *mut u32, 8);
         };
@@ -3070,6 +3078,7 @@ mod tests {
         assert!(!Arc::ptr_eq(moved[0].as_ref().unwrap(), repaired[0].as_ref().unwrap()));
         assert!(Arc::ptr_eq(moved[2].as_ref().unwrap(), repaired[2].as_ref().unwrap()));
         crate::shadow::unregister(owner, base);
+        // SAFETY: start is the base of the allocation made above and is no longer accessed.
         assert_ne!(unsafe { VirtualFree(start as *mut _, 0, MEM_RELEASE) }, 0);
     }
 
@@ -3192,12 +3201,14 @@ mod tests {
         use crate::watch::PAGE;
         // 64 KiB alignment permits real page/record boundary assertions.
         use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RESERVE, MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE};
+        // SAFETY: Windows chooses the address for the three committed writable pages; success is checked below.
         let start = unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGE,
             MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
         assert_ne!(start, 0);
         let count = (3 * PAGE / 32) as u32;
         let per_page = (PAGE / 32) as u32;
         let page = start as usize / PAGE;
+        // SAFETY: All test indices are within the allocated three pages; each record has room for three u32s.
         let write = |index: u32, words: [u32; 3]| unsafe {
             ((start + u64::from(index) * 32) as *mut [u32; 3]).write_unaligned(words)
         };
@@ -3233,6 +3244,7 @@ mod tests {
         assert_eq!(records.observe(start, count, None), u64::from(count));
         assert!(records.pages[1].is_empty());
         assert_eq!(records.observe(start, count, Some((16, vec![]))), u64::from(count));
+        // SAFETY: start is the original allocation base and the test is finished accessing it.
         unsafe { VirtualFree(start as *mut _, 0, MEM_RELEASE) };
     }
 
@@ -3241,10 +3253,13 @@ mod tests {
         use crate::watch::{self, PAGE};
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile, PAGE_READWRITE};
+        // SAFETY: The null optional pointers request an unnamed pagefile-backed section of two pages.
         let section = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(),
             PAGE_READWRITE, 0, (2 * PAGE) as u32, std::ptr::null()) };
         assert!(!section.is_null());
+        // SAFETY: section is a valid handle and the view fits the writable two-page section.
         let a = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE) };
+        // SAFETY: section is still live and the second writable view fits its size.
         let b = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE) };
         let (aa, bb) = (a.Value as usize, b.Value as usize);
         assert_ne!(aa, 0);
@@ -3254,6 +3269,7 @@ mod tests {
         let count = (2 * PAGE / 32) as u32;
         let per_page = (PAGE / 32) as u32;
         let words = [VIEW_TAG, 912, 13];
+        // SAFETY: aa is the checked non-null writable mapping and the record fits in its first page.
         unsafe { (aa as *mut [u32; 3]).write_unaligned(words) };
         // Observe both aliases, so either guard policy can protect them.
         watch::writes(bb, bb + 2 * PAGE, true).unwrap();
@@ -3262,6 +3278,7 @@ mod tests {
         assert_eq!(records.pages[0], [(0, words)]);
         assert_eq!(records.observe(aa as u64, count, watch::writes(aa, aa + 2 * PAGE, true)), 0);
         // No descriptor API: the title copies bytes through another alias.
+        // SAFETY: The two 12-byte ranges are within distinct pages of the live writable mapping; the watch handler handles guard faults.
         unsafe { std::ptr::copy_nonoverlapping(bb as *const u8, (bb + PAGE) as *mut u8, 12) };
         assert_eq!(records.observe(aa as u64, count, watch::writes(aa, aa + 2 * PAGE, true)), u64::from(per_page));
         assert_eq!(records.pages[0], [(0, words)]);
@@ -3273,6 +3290,7 @@ mod tests {
             assert_eq!(records.observe(aa as u64, count, watch::writes(aa, aa + 2 * PAGE, true)), u64::from(per_page));
             assert_eq!(records.observe(aa as u64, count, watch::writes(aa, aa + 2 * PAGE, true)), u64::from(per_page));
         }
+        // SAFETY: Both views and the section are live and no further accesses follow.
         unsafe { UnmapViewOfFile(a); UnmapViewOfFile(b); CloseHandle(section); }
         watch::title_memory_remapped(aa, 2 * PAGE);
         watch::title_memory_remapped(bb, 2 * PAGE);

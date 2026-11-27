@@ -162,12 +162,12 @@ pub struct HeapDemand {
 
 impl HeapDemand {
     pub fn slot(&self, user: &[u32]) -> Option<u32> {
-        if self.code.is_empty() || self.code.len() > 48 || self.code.len() % 2 != 0 {
+        if self.code.is_empty() || self.code.len() > 48 || !self.code.len().is_multiple_of(2) {
             return None;
         }
         let mut stack = [0u32; 24];
         let mut n = 0;
-        for op in self.code.chunks_exact(2) {
+        for op in self.code.as_chunks::<2>().0 {
             let result = match op[0] {
                 0 => op[1],
                 1 => *user.get(op[1] as usize)?,

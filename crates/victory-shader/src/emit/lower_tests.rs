@@ -1,5 +1,3 @@
-#[cfg(test)]
-
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,

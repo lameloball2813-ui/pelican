@@ -240,7 +240,8 @@ impl Jobs {
 
 /// Hands `p` to the bounded pool, promoting it if it is now needed.
 fn start(p: &Arc<Pending>, urgent: bool) {
-    static POOL: OnceLock<(Arc<(Mutex<Jobs>, Condvar)>, usize)> = OnceLock::new();
+    type WorkerPool = (Arc<(Mutex<Jobs>, Condvar)>, usize);
+    static POOL: OnceLock<WorkerPool> = OnceLock::new();
     if p.queued.load(Ordering::Relaxed) && (!urgent || p.urgent.load(Ordering::Relaxed)) {
         return;
     }

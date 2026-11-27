@@ -2145,7 +2145,7 @@ fn logical_lane_snapshot_numerical() {
         let ud = vec![0u32;shader.user_data_dwords().max(1) as usize];
         let out = host.dispatch(&root,&pso,&Dispatch { roots:vec![(0,Root::Constants(ud))],
             views:&[View::RawUav(64*8)],samplers:&[],groups:[1,1,1] }).unwrap_or_else(|e| panic!("{label}: {e}"));
-        for (lane, record) in out[0].chunks_exact(8).enumerate() {
+        for (lane, record) in out[0].as_chunks::<8>().0.iter().enumerate() {
             assert_eq!(record, &[(lane as u32^16)+1,(lane as u32^4)+1,33,1,38,0,0,0],
                 "{label}: lane {lane}");
         }
@@ -2210,7 +2210,7 @@ fn logical_lane_hierarchical_reduction_numerical() {
         let (root,pso) = host.compute_pipeline(&shader).unwrap_or_else(|e|panic!("{label}: {e}"));
         let ud = vec![0;shader.user_data_dwords().max(1) as usize];
         let out = host.dispatch(&root,&pso,&Dispatch { roots:vec![(0,Root::Constants(ud))],views:&[View::RawUav(64*4)],samplers:&[],groups:[1,1,1] }).unwrap_or_else(|e|panic!("{label}: {e}"));
-        for (lane,record) in out[0].chunks_exact(4).enumerate() {
+        for (lane,record) in out[0].as_chunks::<4>().0.iter().enumerate() {
             let l = lane as u32;
             assert_eq!(record,&[if l&9==0 {64-(l|9)} else {0},if l&27==0 {64-(l|27)} else {0},if l<32 {33} else {1},if l==0 {1} else {0}],"{label}: lane {l}");
         }

@@ -70,9 +70,8 @@ impl Host {
         unsafe {
             if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
                 let mut debug: Option<ID3D12Debug> = None;
-                if D3D12GetDebugInterface(&mut debug).is_ok() {
-                    if let Some(debug) = debug { debug.EnableDebugLayer(); }
-                }
+                if D3D12GetDebugInterface(&mut debug).is_ok()
+                    && let Some(debug) = debug { debug.EnableDebugLayer(); }
             }
             let mut device: Option<ID3D12Device> = None;
             if warp {

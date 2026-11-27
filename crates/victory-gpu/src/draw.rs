@@ -41,7 +41,7 @@ enum Root {
 struct FreshTableKey {
     heap: usize,
     table: u64,
-    slots: Vec<(u32, [u32; 3], Option<(ResourceType, u8)>)>,
+    slots: Vec<crate::descriptor::host::SharedRecord>,
     /// A resource can be released without changing the title slot words.
     /// Never reuse a live descriptor snapshot for a now-dead generation.
     live: Vec<bool>,
@@ -56,7 +56,8 @@ struct FreshTable {
 
 /// Layout for the shader's raw CBV scratch root SRV. Each record has exact
 /// byte bounds; invalid views point at the dedicated zero dword.
-fn static_cbv_layout(entries: &[(u64,u32)]) -> Option<(u32,u32,Vec<(u32,u32)>)> {
+type StaticCbvLayout = (u32,u32,Vec<(u32,u32)>);
+fn static_cbv_layout(entries: &[(u64,u32)]) -> Option<StaticCbvLayout> {
     let sentinel = u32::try_from(entries.len().checked_mul(8)?).ok()?;
     let mut total = sentinel.checked_add(4)?.checked_add(255)? & !255;
     let mut header = Vec::with_capacity(entries.len());
@@ -519,7 +520,11 @@ impl State {
             to.add(sentinel as usize).cast::<u32>().write_unaligned(0);
         }
         for (&(address,size),&(offset,_)) in key.1.iter().zip(&header) {
-            if size != 0 { list.defer_fill(unsafe {to.add(offset as usize)}, address as *const u8, size as usize); }
+            if size != 0 {
+                // SAFETY: The scratch layout reserves this range within the mapped allocation.
+                let dest = unsafe { to.add(offset as usize) };
+                list.defer_fill(dest, address as *const u8, size as usize);
+            }
         }
         self.static_cbv_cache.insert(key,gpu);
         Some(gpu)
@@ -640,7 +645,7 @@ impl State {
             let state_us = std::cell::Cell::new(0u64);
             #[cfg(feature = "diagnostics")]
             let enqueue_us = std::cell::Cell::new(0u64);
-            let replay_reads = |ranges: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(u64, u64)>)]| {
+            let replay_reads = |ranges: &[crate::descriptor::host::ShadowRanges]| {
                 #[cfg(feature = "diagnostics")]
                 let phase = std::time::Instant::now();
                 list.ensure_shadow_read_states(ranges);
@@ -822,6 +827,7 @@ impl State {
                 for &(slot, param) in views {
                     if srv && slot == victory_shader::emit::STATIC_CBV_SCRATCH && !t.host.static_table_cbvs.is_empty() {
                         let Some(gpu) = self.static_cbv_scratch(list,&t.host.static_table_cbvs,compute) else { return false; };
+                        // SAFETY: The scratch allocation supplies a live GPU address and param is the root SRV slot in the bound signature.
                         unsafe {
                             if compute { l.SetComputeRootShaderResourceView(param,gpu); }
                             else { l.SetGraphicsRootShaderResourceView(param,gpu); }
@@ -881,6 +887,7 @@ impl State {
                     once!(slot, "unaligned raw root UAV address; dropping operation");
                     return false;
                 }
+                // SAFETY: shadow owns a live resource; GetDesc only queries it.
                 if unsafe { shadow.buffer.GetDesc() }.Flags.0
                     & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
                     once!(slot, "root UAV shadow is not GPU-writable; dropping operation");
@@ -1552,6 +1559,7 @@ impl State {
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         crate::indirect::ready(list, &bounded, count_arg.map(|(b, _)| b));
+        // SAFETY: The list is open; the signature is cached and the ready argument and count buffers are kept alive by the list.
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
@@ -1655,7 +1663,8 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, binding: Option<&cra
         (View::Unordered(resource, counter, desc), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
-            if *counter != 0 || !crate::descriptor::host::depth_uav_use(list, *resource as This, desc.as_ref()) {
+            let needs_transition = *counter != 0 || !crate::descriptor::host::depth_uav_use(list, *resource as This, desc.as_ref());
+            if needs_transition {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
             }
         }
@@ -1728,7 +1737,7 @@ fn expanded_vertices(vertices: u32) -> Option<u32> {
 #[derive(Default)]
 struct HeapReadRanges {
     by_shadow: std::collections::HashMap<usize, usize>,
-    ranges: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(u64, u64)>)>,
+    ranges: Vec<crate::descriptor::host::ShadowRanges>,
 }
 
 impl HeapReadRanges {
@@ -1911,7 +1920,7 @@ mod tests {
             (0, [(18, 1), (123, 2)].into_iter().collect()));
         assert_eq!(heap_buffer_demand(3, &[srv.clone(), unknown], &[18]),
             (2, [(18, 1)].into_iter().collect()));
-        assert_eq!(heap_buffer_demand(3, &[srv.clone()], &[]).0, 3);
+        assert_eq!(heap_buffer_demand(3, std::slice::from_ref(&srv), &[]).0, 3);
         assert_eq!(heap_buffer_demand(3, &[srv, uav], &[1_000_000]).1.get(&0), Some(&1));
         assert_eq!(heap_buffer_demand(1, &[HeapDemand { class: 1, code: vec![5, 0] }], &[]).0, 1);
     }

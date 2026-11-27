@@ -194,7 +194,7 @@ fn guard_physical(first: usize, last: usize) -> Option<Vec<usize>> {
 
 fn guard_physical_impl(first: usize, last: usize, all: bool) -> Option<Vec<usize>> {
     let mut g = guards();
-    if g.physical.range(first..last).next().is_none() { return None; }
+    g.physical.range(first..last).next()?;
     install();
     let mut written = Vec::new();
     let mut run = None;
@@ -216,12 +216,10 @@ fn guard_physical_impl(first: usize, last: usize, all: bool) -> Option<Vec<usize
     if all {
         let mut extra = BTreeSet::new();
         for block in &written {
-            if let Some(key) = g.physical.get(block) {
-                if !g.external.contains_key(key) {
-                    if let Some(aliases) = g.aliases.get(key) {
-                        extra.extend(aliases.iter().copied().filter(|a| !g.protected.contains(a) && !g.kernel_active(*a)));
-                    }
-                }
+            if let Some(key) = g.physical.get(block)
+                && !g.external.contains_key(key)
+                && let Some(aliases) = g.aliases.get(key) {
+                    extra.extend(aliases.iter().copied().filter(|a| !g.protected.contains(a) && !g.kernel_active(*a)));
             }
         }
         let mut run: Option<(usize, usize)> = None;
@@ -247,7 +245,7 @@ fn guard_physical_impl(first: usize, last: usize, all: bool) -> Option<Vec<usize
 /// Registers an actual mapped run of physical section pages. Section ids
 /// must not be reused. The caller reports the mapping only after success.
 pub fn title_physical_view(at: usize, len: usize, section: usize, index: usize) {
-    if at % BLOCK != 0 || len % BLOCK != 0 || at.checked_add(len).is_none() { return; }
+    if !at.is_multiple_of(BLOCK) || !len.is_multiple_of(BLOCK) || at.checked_add(len).is_none() { return; }
     let mut g = guards();
     for (i, block) in (at / BLOCK..(at + len) / BLOCK).enumerate() {
         let key = (section, index + i);
@@ -405,9 +403,8 @@ pub fn begin_kernel_write(at: usize, len: usize, asynchronous: bool) -> KernelWr
     if asynchronous {
         let mut a = a;
         let mut b = b;
-        if let Some((&start, &stop)) = g.asynchronous.range(..=a).next_back() {
-            if stop >= a { a = start; b = b.max(stop); g.asynchronous.remove(&start); }
-        }
+        if let Some((&start, &stop)) = g.asynchronous.range(..=a).next_back()
+            && stop >= a { a = start; b = b.max(stop); g.asynchronous.remove(&start); }
         while let Some((&start, &stop)) = g.asynchronous.range(a..=b).next() {
             b = b.max(stop); g.asynchronous.remove(&start);
         }
@@ -514,11 +511,14 @@ mod tests {
     fn physical_aliases_and_external_writes_invalidate_every_mirror() {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        // SAFETY: Null optional pointers request an unnamed pagefile-backed writable section of one page.
         let section = unsafe {
             CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, PAGE as u32, std::ptr::null())
         };
         assert!(!section.is_null());
+        // SAFETY: The checked section handle is live and the requested writable view fits its size.
         let a = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        // SAFETY: The section remains live and the second writable view fits its size.
         let b = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
         let (a_at, b_at) = (a.Value as usize, b.Value as usize);
         assert!(a_at != 0 && b_at != 0 && a_at != b_at);
@@ -534,24 +534,31 @@ mod tests {
         assert_eq!(guard_physical(ap, ap+1), Some(vec![ap]));
         assert_eq!(guard_physical(ap, ap+1), Some(vec![]));
         // CPU write via B is caught by the handler, dirties A as well.
+        // SAFETY: b_at names a live writable mapped page; the installed handler handles guard faults.
         unsafe { (b_at as *mut u8).write_volatile(0x73); }
         assert_eq!(guard_physical(ap, ap+1), Some(vec![ap]));
+        // SAFETY: a_at names the live alias of the same page, after the write.
         assert_eq!(unsafe { (a_at as *const u8).read_volatile() }, 0x73);
         assert_eq!(guard_physical(bp, bp+1), Some(vec![bp]));
         assert_eq!(guard_physical(ap, ap+1), Some(vec![ap]));
         assert_eq!(guard_physical(ap, ap+1), Some(vec![]));
         {
             let _active = physical_write(id, 0, 1);
+            // SAFETY: The live section covers the requested writable page.
             let temporary = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
             assert!(!temporary.Value.is_null());
             assert_eq!(guard_physical(ap, ap+1), Some(vec![ap]));
+            // SAFETY: The checked non-null temporary mapping is writable and the byte lies within it.
             unsafe { temporary.Value.cast::<u8>().write_volatile(0xc8); }
             assert_eq!(guard_physical(ap, ap+1), Some(vec![ap]));
+            // SAFETY: The temporary view is live and no further access follows.
             unsafe { UnmapViewOfFile(temporary); }
         }
         assert_eq!(guard_physical(ap, ap+1), Some(vec![ap]));
         assert_eq!(guard_physical(ap, ap+1), Some(vec![]));
+        // SAFETY: a_at still names the live mapped page.
         assert_eq!(unsafe { (a_at as *const u8).read_volatile() }, 0xc8);
+        // SAFETY: Both mappings and the section handle are live and no longer used for memory access.
         unsafe { UnmapViewOfFile(a); UnmapViewOfFile(b); CloseHandle(section); }
         title_memory_remapped(a_at, PAGE);
         title_memory_remapped(b_at, PAGE);
@@ -563,9 +570,12 @@ mod tests {
     fn all_alias_guard_keeps_kernel_writer_open_and_each_alias_dirty() {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        // SAFETY: Null optional pointers request an unnamed pagefile-backed writable section of one page.
         let section = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, PAGE as u32, std::ptr::null()) };
         assert!(!section.is_null());
+        // SAFETY: The checked section handle is live and the writable view fits the section.
         let a = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
+        // SAFETY: The section remains live and the second view fits its size.
         let b = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE) };
         let (aa,bb) = (a.Value as usize,b.Value as usize);
         assert!(aa != 0 && bb != 0);
@@ -580,16 +590,20 @@ mod tests {
             assert_eq!(guard_physical_impl(ap,ap+1,true),Some(vec![ap]));
             assert_eq!(guard_physical_impl(bp,bp+1,true),Some(vec![bp]));
             assert!(writable(bb));
+            // SAFETY: bb names the checked writable mapping and the byte is in bounds.
             unsafe { (bb as *mut u8).write_volatile(99); }
             assert_eq!(guard_physical_impl(ap,ap+1,true),Some(vec![ap]));
         }
         assert_eq!(guard_physical_impl(ap,ap+1,true),Some(vec![ap]));
         assert_eq!(guard_physical_impl(ap,ap+1,true),Some(vec![]));
         assert_eq!(guard_physical_impl(bp,bp+1,true),Some(vec![bp]));
+        // SAFETY: bb remains a live mapped page; the installed handler handles any guard fault.
         unsafe { (bb as *mut u8).write_volatile(100); }
         assert_eq!(guard_physical_impl(ap,ap+1,true),Some(vec![ap]));
         assert_eq!(guard_physical_impl(bp,bp+1,true),Some(vec![bp]));
+        // SAFETY: aa is the live alias of the written page.
         assert_eq!(unsafe { (aa as *const u8).read_volatile() },100);
+        // SAFETY: The two views and handle are live and no further memory access follows.
         unsafe { UnmapViewOfFile(a); UnmapViewOfFile(b); CloseHandle(section); }
         title_memory_remapped(aa,PAGE); title_memory_remapped(bb,PAGE);
     }

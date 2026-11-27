@@ -291,7 +291,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             slot: u8::try_from(r.word()?).ok()?,
             table_offset_dwords: r.word()?,
         };
-        if cbv.table_offset_dwords % 8 != 0 || static_table_cbvs.last().is_some_and(|old| *old >= cbv) { return None; }
+        if !cbv.table_offset_dwords.is_multiple_of(8) || static_table_cbvs.last().is_some_and(|old| *old >= cbv) { return None; }
         static_table_cbvs.push(cbv);
     }
     if !static_table_cbvs.is_empty() && !root_srvs.contains(&victory_shader::emit::STATIC_CBV_SCRATCH) { return None; }
@@ -303,7 +303,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         let class = *r.take(1)?.first()?;
         if !matches!(class, 1 | 2) || heap_buffer_classes & class == 0 { return None; }
         let len = r.word()? as usize;
-        if len > 48 || len % 2 != 0 { return None; }
+        if len > 48 || !len.is_multiple_of(2) { return None; }
         let mut code = Vec::with_capacity(len);
         for _ in 0..len { code.push(r.word()?); }
         heap_demands.push(victory_shader::emit::HeapDemand { class, code });

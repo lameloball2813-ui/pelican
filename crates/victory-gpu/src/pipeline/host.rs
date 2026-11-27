@@ -386,7 +386,8 @@ fn wave_lanes_unsupported(
 
 /// Logs a pipeline that gets no host pipeline, once per reason and shader set.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
-    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<(&'static str, Vec<(&'static str, String)>)>>> =
+    type RefusalKey = (&'static str, Vec<(&'static str, String)>);
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<RefusalKey>>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if seen.insert((reason, shaders.iter().map(|s| (s.stage, s.hash.clone())).collect())) {

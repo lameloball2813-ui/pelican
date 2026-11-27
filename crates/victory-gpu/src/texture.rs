@@ -667,7 +667,7 @@ mod tests {
             Residency::Partial(vec![(0, TILE)])
         );
         assert_eq!(dst[..TILE], tile0[..]);
-        let (hash0, bytes0) = hash_intervals(&dst, &[(0, TILE)]);
+        let (hash0, bytes0) = hash_intervals(dst, &[(0, TILE)]);
         assert_eq!(bytes0, TILE);
 
         // Mutating unmapped tail bytes in `dst` must not affect the resident hash.
@@ -676,7 +676,7 @@ mod tests {
             read_resident(region.ptr, dst),
             Residency::Partial(vec![(0, TILE)])
         );
-        let (hash0_repeat, bytes0_repeat) = hash_intervals(&dst, &[(0, TILE)]);
+        let (hash0_repeat, bytes0_repeat) = hash_intervals(dst, &[(0, TILE)]);
         assert_eq!((hash0_repeat, bytes0_repeat), (hash0, TILE));
 
         // Commit a disjoint second 64 KiB tile at `[128 KiB..192 KiB)`.
@@ -694,7 +694,7 @@ mod tests {
         );
         assert_eq!(dst[..TILE], tile0[..]);
         assert_eq!(dst[2 * TILE..3 * TILE], tile2[..]);
-        let (hash_two, bytes_two) = hash_intervals(&dst, &[(0, TILE), (2 * TILE, 3 * TILE)]);
+        let (hash_two, bytes_two) = hash_intervals(dst, &[(0, TILE), (2 * TILE, 3 * TILE)]);
         assert_eq!(bytes_two, 2 * TILE);
         assert_ne!(hash_two, hash0);
 
@@ -706,7 +706,7 @@ mod tests {
         let Residency::Partial(intervals) = res_after_evict else {
             unreachable!();
         };
-        let (hash_after_evict, bytes_after_evict) = hash_intervals(&dst, &intervals);
+        let (hash_after_evict, bytes_after_evict) = hash_intervals(dst, &intervals);
         assert_eq!((hash_after_evict, bytes_after_evict), (hash0, TILE));
         zero_gaps(dst, &intervals);
         assert_eq!(dst[..TILE], tile0[..]);
